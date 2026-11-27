@@ -129,7 +129,8 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
         return turned_down();
     }
     super::PICKING.set(Some(there));
-    let staging = super::staging(resource, &copy, first);
+    // The COPY list can consume only the ordinary CPU-linear staging.
+    let staging = super::staging(resource, &copy, first, false);
     super::PICKING.set(None);
     let Some(staging) = staging.filter(|s| {
         !s.on_demand && s.first == s.level0 && !s.uploaded.load(Relaxed) && s.once.load(Relaxed)

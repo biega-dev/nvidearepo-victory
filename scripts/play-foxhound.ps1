@@ -44,8 +44,11 @@ param(
     [switch]$Ryzen3700X,
     # Use the Ryzen profile with the new command-list, upload and texture-budget paths.
     [switch]$RyzenPreparo,
+    # Ryzen command preparation plus GPU texture detiling for eligible uploads.
+    [switch]$RyzenTexturas,
     [hashtable]$More = @{}
 )
+if ($RyzenTexturas) { $RyzenPreparo = $true }
 if ($RyzenPreparo) { $Ryzen3700X = $true }
 $repo = Split-Path $PSScriptRoot -Parent
 # What the F1 menu saved: its own choices (VICTORY_MENU_...) stand in for this script's options, and its
@@ -144,10 +147,12 @@ if ($RyzenPreparo) {
     $settings.VICTORY_WATCH_BLOCKS = '1'
     $settings.VICTORY_TARGETS_PEAK_ROOM = '1'
     $settings.VICTORY_TEXTURE_QUEUE_DENSE = '1'
+}
+if ($RyzenTexturas) {
     $settings.VICTORY_REFRESH_LOCAL_WORK = '1'
-    $settings.VICTORY_PIPELINE_PACK_SAMPLERS = '1'
     $settings.VICTORY_CARD_COMPARE_RUNS = '1'
-    $settings.VICTORY_REFRESH_MEMO = '1'
+    $settings.VICTORY_REFRESH_SPLIT = '0'
+    $settings.VICTORY_GPU_DETILE = '1'
 }
 if (-not $SeriesS) {
     if ($Res -eq '1440') { $settings.VICTORY_NATIVE_1440P = '1' }
@@ -191,7 +196,8 @@ $settings.VICTORY_MENU_FRAMEGEN = if ($settings.VICTORY_FRAMEGEN -eq '1') { [str
 $settings.VICTORY_MENU_FPS = [string]$fpsWanted
 $settings.VICTORY_MENU_FILE = $menuFile
 $settings.VICTORY_MENU_PLAY = $MyInvocation.MyCommand.Path
-$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($NoFrameGenReady) { ' -NoFrameGenReady' })$(if ($Fast) { ' -Fast' })$(if ($RyzenPreparo) { ' -RyzenPreparo' } elseif ($Ryzen3700X) { ' -Ryzen3700X' })"
+$ryzenArg = if ($RyzenTexturas) { ' -RyzenTexturas' } elseif ($RyzenPreparo) { ' -RyzenPreparo' } elseif ($Ryzen3700X) { ' -Ryzen3700X' }
+$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($NoFrameGenReady) { ' -NoFrameGenReady' })$(if ($Fast) { ' -Fast' })$ryzenArg"
 
 $victory = Join-Path $repo "target\$Build\victory.exe"
 if (-not (Test-Path $victory)) {

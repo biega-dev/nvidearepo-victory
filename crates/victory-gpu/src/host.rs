@@ -845,7 +845,10 @@ pub(crate) fn made_host() -> Option<&'static Host> {
 /// behaves as before: nothing executes).
 pub(crate) fn host() -> Option<&'static Host> {
     HOST.get_or_init(|| match create() {
-        Ok(host) => Some(host),
+        Ok(host) => {
+            crate::gpudetile::start(&host.device);
+            Some(host)
+        }
         Err(e) => {
             tracing::warn!(error = %e, "no host D3D12 device; command lists will not run");
             None
@@ -8106,7 +8109,7 @@ impl HostList {
         batch.refresh_textures();
         waiting
             .into_iter()
-            .filter_map(|upload| upload.finish_refresh().map(|first| (upload, first)))
+            .filter_map(|mut upload| upload.finish_refresh().map(|first| (upload, first)))
             .collect()
     }
 
@@ -10168,6 +10171,20 @@ impl Meter {
             }
             crate::texture::look_once_line(frames);
             crate::texture::ahead::read_ahead_line(frames);
+            if crate::gpudetile::configured() {
+                let [cpu_us, cpu_bytes, cpu_textures] =
+                    [0, 1, 2].map(|i| crate::gpudetile::DETILED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                let [card_textures, card_dispatches, card_bytes, card_us, card_made, card_refused] =
+                    std::array::from_fn::<f64, 6, _>(|i| crate::gpudetile::STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                if cpu_textures + card_textures + card_refused > 0.0 {
+                    tracing::info!(
+                        "texture detiling per frame: CPU {cpu_textures:.1} textures {:.2} MB in {:.2} ms; GPU \
+                         {card_textures:.1} textures in {card_dispatches:.0} dispatches, {:.2} MB staged in {:.2} ms on CPU; \
+                         candidate stagings {card_made:.1} accepted, {card_refused:.1} declined",
+                        cpu_bytes / 1e6, cpu_us / 1e3, card_bytes / 1e6, card_us / 1e3
+                    );
+                }
+            }
             let [through, left, filled, short] =
                 [0, 1, 2, 3].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if through + left + filled > 0.0 {

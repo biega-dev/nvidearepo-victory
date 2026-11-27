@@ -18,6 +18,7 @@
 pub(crate) mod ahead;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -102,6 +103,112 @@ pub(crate) struct Staging {
     /// every subresource; a copy recorded from the buffer while it is still
     /// set zero-fills the buffer first ([`Staging::zero_if_unwritten`]).
     unzeroed: std::sync::atomic::AtomicBool,
+    /// Only resident full textures copied by a DIRECT prelude can hand their
+    /// first content version to compute. The ordinary linear staging remains
+    /// available if the version changes or either optional allocation fails.
+    card: Option<Mutex<FirstDetile>>,
+}
+
+enum FirstDetile {
+    Preparing,
+    Unread(PreparedDetile),
+    Ready(Arc<CardDetile>),
+    /// The snapshot moved to the prelude; the CPU staging still contains
+    /// the tiled bytes of that version, even after its fence retires.
+    Submitted,
+    Done,
+}
+
+impl FirstDetile {
+    fn saved_tiled(&self) -> bool {
+        matches!(self, Self::Ready(_) | Self::Submitted)
+    }
+
+    fn switch_to_cpu(&mut self) -> bool {
+        std::mem::replace(self, Self::Done).saved_tiled()
+    }
+}
+
+/// Immutable from publication through the fence of the copy that consumed
+/// it. In particular, a later list in the same submission can refresh the
+/// CPU staging without changing this dispatch's input or copy source.
+struct CardDetile {
+    raw: ID3D12Resource,
+    linear: ID3D12Resource,
+    shader: &'static crate::gpudetile::Detiler,
+    jobs: Vec<crate::gpudetile::Job>,
+    _reservation: DetileReservation,
+}
+
+static DETILE_BYTES: AtomicU64 = AtomicU64::new(0);
+/// The submission worker already has this much queued work. Keep new
+/// compute dispatches off its DIRECT queue until it catches up.
+const DETILE_BACKLOG: u64 = 8;
+
+/// Both committed buffers are charged in 64 KiB units until their final
+/// owner drops them, including work recorded or still executing.
+struct DetileReservation(u64);
+
+impl DetileReservation {
+    fn take(raw: u64, linear: u64) -> Option<Self> {
+        let bytes = raw.checked_next_multiple_of(65536)?.checked_add(linear.checked_next_multiple_of(65536)?)?;
+        if bytes > 32 << 20 {
+            return None;
+        }
+        DETILE_BYTES.fetch_update(Relaxed, Relaxed, |used| used.checked_add(bytes).filter(|&n| n <= 64 << 20)).ok()?;
+        Some(Self(bytes))
+    }
+}
+
+impl Drop for DetileReservation {
+    fn drop(&mut self) {
+        DETILE_BYTES.fetch_sub(self.0, Relaxed);
+    }
+}
+
+/// The mapping can be filled once. It is consumed before the immutable
+/// CardDetile is published to the submission thread.
+struct PreparedDetile {
+    card: CardDetile,
+    data: usize,
+    raw: crate::gpudetile::Raw,
+}
+
+impl PreparedDetile {
+    fn make(s: &Staging) -> Option<Self> {
+        if crate::queue::queued() >= DETILE_BACKLOG || crate::residency::pressured() || crate::residency::critical_commit() {
+            return None;
+        }
+        let host = host()?;
+        let raw = crate::gpudetile::raw_layout(&s.layout);
+        let linear_bytes = s.bytes.checked_next_multiple_of(4)?;
+        let reservation = DetileReservation::take(raw.bytes, linear_bytes)?;
+        let [budget, used, ..] = host.video_memory()?;
+        if used.saturating_add(reservation.0) > crate::resource::room_line(budget)
+            || budget.saturating_sub(used) < (512 << 20) + reservation.0
+        {
+            return None;
+        }
+        let jobs = crate::gpudetile::jobs(&s.layout, &s.footprints, &s.rows, s.mips, &raw, s.bytes)?;
+        let shader = crate::gpudetile::detiler()?;
+        let linear = host.uav_buffer(linear_bytes)?;
+        let (source, data) = host.upload_buffer(raw.bytes)?;
+        // SAFETY: the private mapping holds the whole layout, mask and tables.
+        unsafe { crate::gpudetile::write_tables(&s.layout, &raw, data) };
+        let card = CardDetile { raw: source, linear, shader, jobs, _reservation: reservation };
+        Some(Self { card, data: data as usize, raw })
+    }
+
+    fn fill(self, tiled: &[u8], held: u32) -> CardDetile {
+        let data = self.data as *mut u8;
+        // SAFETY: the caller supplied exactly layout.size bytes. This is the
+        // only writer to the private mapping and this method consumes it.
+        unsafe {
+            std::ptr::copy_nonoverlapping(tiled.as_ptr(), data, tiled.len());
+            crate::gpudetile::write_mask(&self.raw, data, held);
+        }
+        self.card
+    }
 }
 
 /// Since the last pass line, with [`crate::pool::no_zero`]: staging pieces
@@ -915,12 +1022,13 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     };
     let texture = &copy.texture;
     ahead::listed(&copy);
-    let Some(staging) = staging(resource, &copy, first) else {
+    let baking = BAKING.get();
+    let conditional = !baking && prelude_uploads();
+    let Some(staging) = staging(resource, &copy, first, conditional) else {
         return;
     };
     UPLOAD_STAGED.set(true);
     use std::sync::atomic::Ordering::Relaxed;
-    let baking = BAKING.get();
     if baking {
         staging.exact.store(true, Relaxed);
     }
@@ -978,7 +1086,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     // With `VICTORY_PRELUDE_UPLOADS=1`: whether to upload is decided when
     // the list is submitted, after the check that refreshes the staging
     // buffer, and the copy goes on the list's prelude ([`PreludeUpload`]).
-    if prelude_uploads() && !baking {
+    if conditional {
         if no_wait() && fill_unlocked() {
             let there = match picking {
                 Some(there) if there != u64::MAX => there,
@@ -987,7 +1095,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
             staging.expected.store(there, Relaxed);
         }
         let on_demand = if staging.on_demand { crate::resource::host_tiled(resource) } else { None };
-        list.defer_prelude_upload(PreludeUpload { staging, copy, on_demand, resource: resource as usize });
+        list.defer_prelude_upload(PreludeUpload { staging, copy, on_demand, resource: resource as usize, card: None });
         return;
     }
     // The host texture has the staging buffer's contents: only the check
@@ -1124,6 +1232,9 @@ pub(crate) struct PreludeUpload {
     /// The title's texture, for the check at submission that the host has
     /// not written it since the list was recorded ([`host_written`]).
     resource: usize,
+    /// Per accepted upload, including separately refreshed lists submitted
+    /// together. The copy of this entry stored on the HostList starts empty.
+    card: Option<Arc<CardDetile>>,
 }
 
 /// Whether a host copy or resolve has written the title's texture `resource`.
@@ -1149,7 +1260,7 @@ impl PreludeUpload {
     /// list's prelude records the copy into the host texture, with what the
     /// list's own upload noted when it was recorded (a host copy grown, the
     /// levels on demand given memory, what the host copy holds).
-    pub(crate) fn finish_refresh(&self) -> Option<bool> {
+    pub(crate) fn finish_refresh(&mut self) -> Option<bool> {
         use std::sync::atomic::Ordering::Relaxed;
         // The host wrote the texture (a bake's copy into it) after this list
         // was recorded, on another recording thread: its title memory holds
@@ -1175,6 +1286,10 @@ impl PreludeUpload {
             }
             return None;
         }
+        // A read-ahead thread may be filling the first snapshot. Take the
+        // dirty bit and its matching version together, under the same lock
+        // used by the refresh. Other staging keeps the original fast path.
+        let last = self.staging.card.as_ref().map(|_| self.staging.last.lock().unwrap_or_else(|e| e.into_inner()));
         let Some(first_upload) = claim_upload(&self.staging.uploaded, &self.staging.dirty) else {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexSkipped, 1);
@@ -1182,12 +1297,24 @@ impl PreludeUpload {
         };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexUploads, 1);
-        // A piece handed out without its zeros that nothing detiled whole is
-        // zero-filled here, before the prelude is recorded under the list's
-        // states lock: `record` would make the submit thread wait for `last`
-        // there, with that lock held. A load and nothing more once the flag
-        // is clear.
-        self.staging.zero_if_unwritten();
+        if let Some(card) = &self.staging.card {
+            let mut first = card.lock().unwrap_or_else(|e| e.into_inner());
+            match std::mem::replace(&mut *first, FirstDetile::Done) {
+                FirstDetile::Ready(snapshot) => {
+                    self.card = Some(snapshot);
+                    *first = FirstDetile::Submitted;
+                }
+                // A repeated request for this same version can still be
+                // fulfilled after the dedicated GPU buffers have retired.
+                FirstDetile::Submitted => self.staging.restore_linear(),
+                other => *first = other,
+            }
+        }
+        drop(last);
+        // Zero a reused CPU source outside the prelude's states lock.
+        if self.card.is_none() {
+            self.staging.zero_if_unwritten();
+        }
         // A host copy that took the place of one with fewer levels: the slots
         // that show that one are made again once this upload has run.
         if self.staging.first == self.staging.level0 && self.copy.grown.swap(false, Relaxed) {
@@ -1215,8 +1342,22 @@ impl PreludeUpload {
     /// Records the copy of the staging buffer into the host texture on
     /// `list` (the prelude), the host texture in the copy destination state.
     pub(crate) fn record(&self, list: &ID3D12GraphicsCommandList) {
-        // (Done in `finish_refresh` already; kept for any other caller.)
-        self.staging.zero_if_unwritten();
+        let (source, base) = match &self.card {
+            Some(card) => {
+                crate::gpudetile::record(list, card.shader, &card.raw, &card.linear, &card.jobs);
+                crate::gpudetile::STATS[0].fetch_add(1, Relaxed);
+                crate::gpudetile::STATS[1].fetch_add(card.jobs.len() as u64, Relaxed);
+                // The temporary uploads vector is dropped before execution.
+                // STARTED already includes this submission; FINISHED is
+                // published only after the fence. Also holds the reservation.
+                crate::host::retire(Arc::clone(card));
+                (&card.linear, 0)
+            }
+            None => {
+                self.staging.zero_if_unwritten();
+                (&self.staging.buffer, self.staging.base)
+            }
+        };
         let texture = &self.copy.texture;
         // The staging buffer lives as long as `self.staging`, which the
         // list's steps hold until it is reset.
@@ -1231,11 +1372,11 @@ impl PreludeUpload {
             };
             let from = D3D12_TEXTURE_COPY_LOCATION {
                 // SAFETY: as above.
-                pResource: unsafe { std::mem::transmute_copy(&self.staging.buffer) },
+                pResource: unsafe { std::mem::transmute_copy(source) },
                 Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                     PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                        Offset: self.staging.base + footprint.Offset,
+                        Offset: base + footprint.Offset,
                         ..*footprint
                     },
                 },
@@ -2009,8 +2150,66 @@ impl Staging {
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
         }
+        let started = crate::gpudetile::configured().then(std::time::Instant::now);
+        let mut replacing_tiled = false;
+        if let Some(card) = &self.card {
+            let mut first = card.lock().unwrap_or_else(|e| e.into_inner());
+            let previous = std::mem::replace(&mut *first, FirstDetile::Done);
+            replacing_tiled = previous.saved_tiled();
+            if let FirstDetile::Unread(prepared) = previous
+                && tiled.len() as u64 == self.layout.size
+                && !self.uploaded.load(Relaxed)
+                && crate::queue::queued() < DETILE_BACKLOG && !crate::residency::pressured()
+            {
+                // Keep the last readable version for a later bake or COPY
+                // list after title memory goes away. The ordinary staging
+                // already fits it. No CPU copy from this buffer is in flight:
+                // only conditional lists have used it, none has uploaded it.
+                // SAFETY: covered by the size gate at staging creation and
+                // the exact-length check above, under the texture's lock.
+                unsafe { std::ptr::copy_nonoverlapping(tiled.as_ptr(), self.data, tiled.len()) };
+                *first = FirstDetile::Ready(Arc::new(prepared.fill(tiled, held)));
+                crate::gpudetile::STATS[2].fetch_add(tiled.len() as u64, Relaxed);
+                if let Some(started) = started {
+                    crate::gpudetile::STATS[3].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+                }
+                return;
+            }
+        }
+        self.detile_cpu(tiled, held, replacing_tiled, started);
+    }
+
+    /// An immediate or COPY list may arrive even after the GPU buffers have
+    /// retired and the title unmapped the texture. Recover the same linear
+    /// bytes into the existing staging, and keep this texture on the CPU.
+    fn require_linear(&self) {
+        let Some(card) = &self.card else { return };
+        let _last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        if card.lock().unwrap_or_else(|e| e.into_inner()).switch_to_cpu() {
+            self.restore_linear();
+        }
+    }
+
+    /// Called under last when the full tiled version occupies this piece.
+    fn restore_linear(&self) {
+        let started = Some(std::time::Instant::now());
+        // SAFETY: the staging contains the entire saved version. No GPU
+        // list reads it while it is tiled.
+        unsafe {
+            with_saved_tiled(self.data, self.layout.size as usize, |tiled| {
+                self.detile_cpu(tiled, u32::MAX, true, started);
+            });
+        }
+    }
+
+    fn detile_cpu(&self, tiled: &[u8], held: u32, replacing_tiled: bool, started: Option<std::time::Instant>) {
+        let _timed = started.map(|started| {
+            crate::gpudetile::DETILED[1].fetch_add(tiled.len() as u64, Relaxed);
+            crate::gpudetile::DETILED[2].fetch_add(1, Relaxed);
+            CpuDetileTime(started)
+        });
         // (Never set without `VICTORY_STAGING_NO_ZERO`.)
-        let unzeroed = self.unzeroed.load(std::sync::atomic::Ordering::Relaxed);
+        let unzeroed = replacing_tiled || self.unzeroed.load(std::sync::atomic::Ordering::Relaxed);
         let mut failed = false;
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
             let (mip, slice) = self.part(i);
@@ -2073,6 +2272,25 @@ impl Staging {
             unsafe { std::ptr::write_bytes(self.data, 0, self.bytes as usize) };
             STAGING_ZEROS[1].fetch_add(1, Relaxed);
         }
+    }
+}
+
+struct CpuDetileTime(std::time::Instant);
+
+/// Copy the saved version before the CPU detiler overwrites the same pool
+/// piece with linear footprints. The caller owns access to the mapping.
+unsafe fn with_saved_tiled(data: *const u8, size: usize, f: impl FnOnce(&[u8])) {
+    with_read(size, |saved| {
+        // SAFETY: the caller provides size initialized bytes; the scratch
+        // buffer belongs to this thread and is distinct from the mapping.
+        unsafe { std::ptr::copy_nonoverlapping(data, saved.as_mut_ptr(), size) };
+        f(saved);
+    });
+}
+
+impl Drop for CpuDetileTime {
+    fn drop(&mut self) {
+        crate::gpudetile::DETILED[0].fetch_add(self.0.elapsed().as_micros() as u64, Relaxed);
     }
 }
 
@@ -2429,18 +2647,23 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
 }
 
 /// The staging state of a title texture, made on first use.
-fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> Option<Arc<Staging>> {
+fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32, conditional: bool) -> Option<Arc<Staging>> {
     let texture = &copy.texture;
     // Asked before the table is locked: the sweep lets go of a staging
     // buffer with its texture's host side locked, in that order.
     let on_demand = crate::resource::host_tiled(resource).is_some();
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let map = map.get_or_insert_with(HashMap::new);
+    let mut table = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let map = table.get_or_insert_with(HashMap::new);
     if let Some(s) = map.get(&(resource as usize))
         && s.first <= first.max(copy.base)
         && s.serial == copy.serial
     {
-        return Some(s.clone());
+        let s = s.clone();
+        drop(table);
+        if !conditional {
+            s.require_linear();
+        }
+        return Some(s);
     }
     let (memory, desc) = crate::resource::texture_memory(resource)?;
     let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
@@ -2470,9 +2693,15 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
     let mut rows = vec![0u32; count as usize];
     let mut total = 0;
-    // With `VICTORY_STAGING_NO_ZERO`, the bytes of each row a copy reads too.
+    // Taking a snapshot is worthwhile only for tiled textures that can use
+    // the prelude. On-demand levels may request the very same bytes again
+    // without a refresh, so keep their original persistent CPU source.
+    let card = conditional && !on_demand && first == 0 && level0 == 0
+        && layout.desc.swizzle.0 != 0 && (65536..=32 << 20).contains(&layout.size)
+        && crate::gpudetile::on();
     let no_zero = crate::pool::no_zero();
-    let mut row_bytes = if no_zero { vec![0u64; count as usize] } else { Vec::new() };
+    let check_rows = no_zero || card;
+    let mut row_bytes = if check_rows { vec![0u64; count as usize] } else { Vec::new() };
     // SAFETY: outputs for `count` subresources.
     unsafe {
         host.device.GetCopyableFootprints(
@@ -2482,14 +2711,14 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
             0,
             Some(footprints.as_mut_ptr()),
             Some(rows.as_mut_ptr()),
-            if no_zero { Some(row_bytes.as_mut_ptr()) } else { None },
+            if check_rows { Some(row_bytes.as_mut_ptr()) } else { None },
             Some(&mut total),
         );
     }
     // A piece may be handed out without its zero-fill only where the
     // detiling writes all that the copies read; as `Staging::part` counts
     // subresources.
-    let leave = no_zero && {
+    let covers = check_rows && {
         let levels = mips - first;
         detile_covers((0..count as usize).map(|i| {
             let mip = first + i as u32 % levels;
@@ -2500,6 +2729,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
             (level, (row_bytes[i], rows[i], footprints[i].Footprint.Depth))
         }))
     };
+    let leave = no_zero && covers;
     let (piece, buffer, base, data, unzeroed) = match crate::pool::staging(host, total, leave) {
         Some((piece, buffer, base, data, again)) => {
             if no_zero && again {
@@ -2529,6 +2759,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+    let card = card && covers && layout.size <= total;
     let s = Arc::new(Staging {
         buffer,
         base,
@@ -2559,14 +2790,72 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         waiting: std::sync::atomic::AtomicU64::new(0),
         exact: std::sync::atomic::AtomicBool::new(BAKING.get()),
         unzeroed: std::sync::atomic::AtomicBool::new(unzeroed),
+        card: card.then(|| Mutex::new(FirstDetile::Preparing)),
     });
     map.insert(resource as usize, s.clone());
+    drop(table);
+    if let Some(card) = &s.card {
+        // Shader compilation and resident committed buffers can wait on the
+        // driver. Keep this off the refresh path and outside the table lock.
+        // A refresh racing preparation simply uses the ordinary staging.
+        let prepared = PreparedDetile::make(&s);
+        let mut state = card.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(*state, FirstDetile::Preparing) {
+            crate::gpudetile::STATS[if prepared.is_some() { 4 } else { 5 }].fetch_add(1, Relaxed);
+            *state = prepared.map_or(FirstDetile::Done, FirstDetile::Unread);
+        }
+    }
     Some(s)
 }
 
 #[cfg(test)]
 mod title_memory_tests {
     use super::with_title;
+
+    #[test]
+    fn a_cpu_only_upload_after_a_card_upload_preserves_an_unmapped_textures_last_bytes() {
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        let layout = Layout::new(&Desc {
+            dimension: Dimension::Tex2d, width: 128, height: 128, depth: 1, mips: 1,
+            element_bytes: 4, block: 1, samples: 1, swizzle: Swizzle::SW_64KB_S,
+        }).unwrap();
+        let bytes = 128 * 128 * 4;
+        assert_eq!(layout.size, bytes as u64);
+        let title: Vec<u8> = (0..bytes).map(|i| ((i * 31) ^ (i >> 8)) as u8).collect();
+        let mut expected = vec![0; bytes];
+        layout.detile(&title, 0, 0, &mut expected, 512, bytes).unwrap();
+        let mut staging = title.clone();
+        drop(title);
+        assert_ne!(staging, expected);
+
+        // The dedicated snapshot and title memory are both gone. The bake
+        // has only the staging piece where the first refresh saved the tiles.
+        let mut state = super::FirstDetile::Submitted;
+        assert!(state.switch_to_cpu());
+        // SAFETY: staging holds all the tiles; the helper makes a distinct
+        // copy before the callback writes over the staging piece.
+        unsafe {
+            super::with_saved_tiled(staging.as_ptr(), bytes, |tiled| {
+                layout.detile(tiled, 0, 0, &mut staging, 512, bytes).unwrap();
+            });
+        }
+        assert_eq!(staging, expected);
+        assert!(!state.switch_to_cpu(), "a second CPU request keeps the linear bytes");
+    }
+
+    #[test]
+    fn detile_reservations_include_both_committed_buffers_until_dropped() {
+        use super::DetileReservation;
+        assert!(DetileReservation::take(u64::MAX, 1).is_none());
+        assert!(DetileReservation::take(32 << 20, 1).is_none());
+        let first = DetileReservation::take(16 << 20, 16 << 20).unwrap();
+        let second = DetileReservation::take(16 << 20, (16 << 20) - 1).unwrap();
+        assert_eq!(second.0, 32 << 20);
+        assert!(DetileReservation::take(1, 1).is_none());
+        drop(first);
+        let replacement = DetileReservation::take(1, 1).unwrap();
+        assert_eq!(replacement.0, 2 * 65536);
+    }
 
     /// Whether memory is all there is answered by the runtime's views of
     /// physical pages where they lie, and by Windows where none does.
