@@ -137,9 +137,9 @@ struct Spread {
 ///
 /// With no `probe`, or `small` false, or fewer than two to do: all of it goes
 /// to `wide_each` as it did.
-fn spread_with(n: usize, small: bool, probe: Option<Duration>, work: impl Fn(usize) + Send + Sync + 'static) -> Spread {
+fn spread_with(n: usize, small: bool, textures: Option<usize>, probe: Option<Duration>, work: impl Fn(usize) + Send + Sync + 'static) -> Spread {
     let Some(probe) = probe.filter(|_| small && n >= 2) else {
-        crate::shadow::wide_each(n, work);
+        crate::shadow::wide_each_from(n, textures, work);
         return Spread { here: 0, went: true };
     };
     let started = std::time::Instant::now();
@@ -148,7 +148,7 @@ fn spread_with(n: usize, small: bool, probe: Option<Duration>, work: impl Fn(usi
         return Spread { here, went: false };
     }
     // What the thread did not get to: numbers from `here` on.
-    crate::shadow::wide_each(n - here, move |i| work(here + i));
+    crate::shadow::wide_each_from(n - here, textures.map(|t| t.saturating_sub(here)), move |i| work(here + i));
     Spread { here, went: true }
 }
 
@@ -169,27 +169,29 @@ fn serial_first(n: usize, probe: Duration, mut elapsed: impl FnMut() -> Duration
 /// [`spread_with`] under [`probe`], counted. `small`: the caller's flush is one
 /// the probe is for (few spans, and no textures due, or with
 /// `VICTORY_REFRESH_PROBE_TEXTURES=1` only light ones: [`textures_small`]).
-pub(super) fn spread(n: usize, small: bool, work: impl Fn(usize) + Send + Sync + 'static) {
+/// `textures` counts the leading textures when the remaining copies may
+/// be grouped. The probe and counters always count individual refreshes.
+pub(super) fn spread(n: usize, small: bool, textures: Option<usize>, work: impl Fn(usize) + Send + Sync + 'static) {
     let Some(probe) = probe().filter(|_| small && n >= 2) else {
         // (with the split switch off no clock is read and no counter touched.)
         if !crate::shadow::refresh_split() {
-            crate::shadow::wide_each(n, work);
+            crate::shadow::wide_each_from(n, textures, work);
             return;
         }
         if n == 0 {
             SPLIT[0].fetch_add(1, Ordering::Relaxed);
-            crate::shadow::wide_each(n, work);
+            crate::shadow::wide_each_from(n, textures, work);
             return;
         }
         let started = std::time::Instant::now();
-        crate::shadow::wide_each(n, work);
+        crate::shadow::wide_each_from(n, textures, work);
         SPLIT[1].fetch_add(1, Ordering::Relaxed);
         SPLIT[2].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
         SPLIT[3].fetch_add(n as u64, Ordering::Relaxed);
         return;
     };
     let started = std::time::Instant::now();
-    let done = spread_with(n, small, Some(probe), work);
+    let done = spread_with(n, small, textures, Some(probe), work);
     // (The time is the whole call: the part on this thread is what the probe
     // bounds, and when the rest went out the call is longer. The line says so.)
     let k = usize::from(done.went);
@@ -719,7 +721,7 @@ mod tests {
                     called[i].fetch_add(1, Ordering::Relaxed);
                 }
             };
-            let done = spread_with(n, small, probe, work);
+            let done = spread_with(n, small, Some(3), probe, work);
             assert!(called.iter().all(|c| c.load(Ordering::Relaxed) == 1), "n {n}, small {small}, probe {probe:?}");
             // Where it went.
             match (n, small, probe) {

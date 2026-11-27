@@ -33,6 +33,7 @@ use std::sync::{Condvar, Mutex, RwLock};
 
 mod epochs;
 use epochs::Epochs;
+pub(crate) mod memo;
 
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
@@ -62,6 +63,9 @@ impl Journal {
     /// Page `page` was found written by asking `now`: the parts in `parts`
     /// (a bit each). The asking that found it written before (0: none).
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
+        if let Some(writes) = self.memo_writes {
+            writes.record(page, now);
+        }
         let before = self.written.record(page, now);
         if parts == WHOLE || !parts_on() {
             self.parts.remove(&page);
@@ -89,6 +93,9 @@ impl Journal {
 /// the asking it took the page at): the parts to take again, a bit for each
 /// 4 KiB, in the same order.
 pub(crate) fn parts_written(pages: &[(usize, u64)]) -> Vec<u16> {
+    if pages.is_empty() && memo::enabled() {
+        return Vec::new();
+    }
     let j = journal();
     pages.iter().map(|&(page, taken)| j.parts_since(page, taken)).collect()
 }
@@ -130,20 +137,88 @@ fn watch_index() -> bool {
     *ON.get_or_init(|| crate::switch::on("VICTORY_WATCH_INDEX"))
 }
 
+/// VICTORY_WATCH_SPANS=1 holds only the pages a submission's resets can
+/// touch. The title's bytes stay in place: only CPU metadata is shared.
+fn watch_spans() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_WATCH_SPANS"))
+}
+
+// A successful reset belongs to the allocation Windows saw. Serialize
+// publishing its memo number with withdrawing it on a change of mapping.
+// This lock never covers a kernel call or the acquisition of another lock.
+static SPAN_PUBLICATION: Mutex<MappingHistory> = Mutex::new(MappingHistory {
+    number: 0, recent: std::collections::VecDeque::new(), freeing: Vec::new(),
+});
+static SPAN_MAPPING: AtomicU64 = AtomicU64::new(0);
+
+struct MappingHistory {
+    number: u64,
+    recent: std::collections::VecDeque<(usize, usize)>,
+    freeing: Vec<(usize, usize)>,
+}
+
+impl MappingHistory {
+    fn changed(&mut self, pages: (usize, usize)) {
+        // Older askings are retried. Bound the work of checking one after
+        // a burst of unrelated allocations.
+        if self.recent.len() == 64 {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(pages);
+        self.number = self.number.saturating_add(1);
+        SPAN_MAPPING.store(self.number, Ordering::Release);
+        memo::mapping_changed();
+    }
+
+    fn changed_since(&self, since: u64, first: usize, last: usize) -> bool {
+        if self.number == u64::MAX { return true; }
+        let Some(ago) = self.number.checked_sub(since) else { return true };
+        ago > self.recent.len() as u64
+            || self.recent.iter().rev().take(ago as usize).any(|&(a, b)| a < last && first < b)
+    }
+
+    fn unchanged(&self, since: u64, first: usize, last: usize) -> bool {
+        !self.changed_since(since, first, last)
+            && !self.freeing.iter().any(|&(a, b)| a < last && first < b)
+    }
+}
+
+fn page_span(at: usize, len: usize) -> (usize, usize) {
+    (at / PAGE, at.saturating_add(len).div_ceil(PAGE))
+}
+
+fn query_mapping() -> u64 {
+    let number = SPAN_MAPPING.load(Ordering::Acquire);
+    // An unmap is announced before its kernel call. An asking that
+    // starts in that interval can see the old allocation after its
+    // announcement. It still reports writes, but cannot promise coverage.
+    if changes().is_multiple_of(2) { number } else { u64::MAX }
+}
+
+fn mapping_changed(pages: (usize, usize)) {
+    if watch_spans() || cfg!(test) {
+        SPAN_PUBLICATION.lock().unwrap_or_else(|e| e.into_inner()).changed(pages);
+    } else {
+        memo::mapping_changed();
+    }
+}
+
 /// The ranges a single successful kernel asking covered. Two adjacent or
 /// overlapping askings cannot answer a query that crosses between them.
 #[derive(Default)]
 struct AskedRanges {
     ranges: Vec<(usize, usize)>,
     indexed: bool,
+    mapping: Option<u64>,
 }
 
 impl AskedRanges {
-    const EMPTY: Self = Self { ranges: Vec::new(), indexed: false };
+    const EMPTY: Self = Self { ranges: Vec::new(), indexed: false, mapping: None };
     const SMALL: usize = 12;
 
     fn new(ranges: Vec<(usize, usize)>, indexed: bool) -> Self {
-        let mut ahead = Self { ranges, indexed };
+        let mut ahead = Self { ranges, indexed, mapping: None };
         if indexed && ahead.ranges.len() > Self::SMALL {
             ahead.order();
         }
@@ -164,6 +239,10 @@ impl AskedRanges {
     }
 
     fn covers(&self, first: usize, last: usize) -> bool {
+        if self.mapping.is_some_and(|at| at != SPAN_MAPPING.load(Ordering::Acquire)
+            && !SPAN_PUBLICATION.lock().unwrap_or_else(|e| e.into_inner()).unchanged(at, first, last)) {
+            return false;
+        }
         if !self.indexed || self.ranges.len() <= Self::SMALL {
             return self.ranges.iter().any(|&(a, b)| a <= first && last <= b);
         }
@@ -192,6 +271,20 @@ impl AskedRanges {
 
     fn clear(&mut self) {
         self.ranges.clear();
+        self.mapping = None;
+    }
+
+    // Each successful kernel reset vouches for one interval. Drop a
+    // whole interval if a mapping inside it changed during the asking.
+    fn revalidate(&mut self, since: u64, history: &MappingHistory) -> bool {
+        if since == history.number && since != u64::MAX && history.freeing.is_empty() {
+            self.mapping = Some(since);
+            return true;
+        }
+        let before = self.ranges.len();
+        self.ranges.retain(|&(first, last)| history.unchanged(since, first, last));
+        self.mapping = Some(history.number);
+        self.ranges.len() == before
     }
 
     /// A failed kernel query leaves its contained ranges to be asked for.
@@ -209,6 +302,8 @@ impl AskedRanges {
 }
 
 struct Journal {
+    /// Published under this writer's lock before a dirty page is observable.
+    memo_writes: Option<&'static memo::Writes>,
     /// Page number → the asking that last found it written.
     written: Epochs,
     /// The same for each of a page's sixteen parts ([`KERNEL_PAGE`]), where
@@ -233,6 +328,7 @@ struct Journal {
 /// the submitting thread, and one in six of those at the six threads beside
 /// it, found it waiting for that lock (run pooloff1).
 static JOURNAL: std::sync::LazyLock<RwLock<Journal>> = std::sync::LazyLock::new(|| RwLock::new(Journal {
+    memo_writes: (cfg!(test) || memo::enabled()).then_some(&memo::WRITES),
     // VICTORY_WATCH_BLOCKS=1 keeps last-write numbers together for 64
     // adjacent pages. A refresh in the prison asked about some 5,500 ranges
     // a frame. The same lock and the same guard/asking decide what is known.
@@ -305,25 +401,48 @@ pub(crate) fn lock_waits(frames: f64) -> String {
 /// answers, so until the answer is in the journal no other thread may ask
 /// about any of the same pages (it would be told they were not written).
 /// Taken before the journal's lock, never under it.
-static ASKING: (Mutex<Vec<(usize, usize)>>, Condvar) = (Mutex::new(Vec::new()), Condvar::new());
+static ASKING: (Mutex<Held>, Condvar) = (Mutex::new(Held { singles: Vec::new(), batch: None }), Condvar::new());
+
+struct Held {
+    singles: Vec<(usize, usize)>,
+    // One submission publishes the journal at a time. Its disjoint spans
+    // are in address order, so a worker can check for a conflict by address.
+    batch: Option<Vec<(usize, usize)>>,
+}
+
+fn overlaps_spans(spans: &[(usize, usize)], first: usize, last: usize) -> bool {
+    let n = spans.partition_point(|&(_, end)| end <= first);
+    spans.get(n).is_some_and(|&(start, _)| start < last)
+}
 
 /// Pages `[first, last)` held in [`ASKING`] until dropped.
-struct Asking(usize, usize);
+enum Asking {
+    Range(usize, usize),
+    Batch,
+}
 
 impl Asking {
     fn hold(first: usize, last: usize) -> Asking {
-        let mut held = ASKING.0.lock().unwrap_or_else(|e| e.into_inner());
-        if held.iter().any(|&(a, b)| a < last && first < b) {
-            held = waited(0, || {
-                let mut held = held;
-                while held.iter().any(|&(a, b)| a < last && first < b) {
-                    held = ASKING.1.wait(held).unwrap_or_else(|e| e.into_inner());
-                }
-                held
-            });
+        let mut held = Self::wait(|h| h.singles.iter().any(|&(a, b)| a < last && first < b)
+            || h.batch.as_ref().is_some_and(|s| overlaps_spans(s, first, last)));
+        held.singles.push((first, last));
+        Asking::Range(first, last)
+    }
+
+    fn wait(busy: impl Fn(&Held) -> bool) -> std::sync::MutexGuard<'static, Held> {
+        let held = ASKING.0.lock().unwrap_or_else(|e| e.into_inner());
+        if busy(&held) {
+            waited(0, || ASKING.1.wait_while(held, |h| busy(h)).unwrap_or_else(|e| e.into_inner()))
+        } else {
+            held
         }
-        held.push((first, last));
-        Asking(first, last)
+    }
+
+    fn batch(spans: Vec<(usize, usize)>) -> Asking {
+        let mut held = Self::wait(|h| h.batch.is_some()
+            || h.singles.iter().any(|&(first, last)| overlaps_spans(&spans, first, last)));
+        held.batch = Some(spans);
+        Asking::Batch
     }
 
     /// Everything: an asking for a whole submission.
@@ -335,8 +454,13 @@ impl Asking {
 impl Drop for Asking {
     fn drop(&mut self) {
         let mut held = ASKING.0.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(i) = held.iter().position(|&r| r == (self.0, self.1)) {
-            held.swap_remove(i);
+        match *self {
+            Asking::Range(first, last) => {
+                if let Some(i) = held.singles.iter().position(|&r| r == (first, last)) {
+                    held.singles.swap_remove(i);
+                }
+            }
+            Asking::Batch => { held.batch = None; }
         }
         drop(held);
         ASKING.1.notify_all();
@@ -425,9 +549,39 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+    ask_ahead_scoped(ranges, watch_spans());
+}
+
+// A nested flush can keep the submission's grouping across unrelated
+// allocations. If any group expired, let this flush build its own asking.
+pub(crate) fn asking_stands() -> bool {
+    let j = journal();
+    if !j.kept || j.ahead.mapping.is_none_or(|n| n == SPAN_MAPPING.load(Ordering::Acquire)) {
+        return j.kept;
+    }
+    drop(j);
+    let mut j = journal_mut();
+    if !j.kept { return false; }
+    let Some(at) = j.ahead.mapping else { return true };
+    let history = SPAN_PUBLICATION.lock().unwrap_or_else(|e| e.into_inner());
+    if at != history.number {
+        j.kept = j.ahead.revalidate(at, &history);
+        if !j.kept {
+            // A submission write is recorded only while kept. Leave no
+            // ranges behind that could answer from before such a write.
+            j.ahead.clear();
+        }
+        // A worker may have cached the prior coverage under its old memo
+        // number. Every republication gets its own number.
+        memo::set_ahead(if j.kept { next_asking() } else { 0 });
+    }
+    j.kept
+}
+
+fn ask_ahead_scoped(ranges: &[(usize, usize)], scoped: bool) {
     // A nested flush can cover thousands of copies. While ask_once stands,
     // it will discard all these pieces; skip reading the bits and sorting.
-    if watch_index() && (ranges.len() < 2 || journal().kept) {
+    if watch_index() && (ranges.len() < 2 || asking_stands()) {
         return;
     }
     let mut pieces: Vec<(usize, usize)> = ranges
@@ -443,10 +597,32 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     pieces.sort_unstable();
     // The submission's one asking stands ([`ask_once`]): what it does not
     // hold is left to `writes`.
-    if journal().kept {
+    if asking_stands() {
         return;
     }
     let _all = Asking::hold_all();
+    if scoped && asking_stands() {
+        return;
+    }
+    let mapping = scoped.then(query_mapping);
+    let (asked, written) = ask_pieces(&pieces);
+    note_hot(&written);
+    let mut ahead = AskedRanges::new(asked, watch_index());
+    let mut j = journal_mut();
+    let now = next_asking();
+    for (page, parts) in written {
+        j.note(page, parts, now);
+    }
+    let history = mapping.map(|_| SPAN_PUBLICATION.lock().unwrap_or_else(|e| e.into_inner()));
+    if let (Some(at), Some(history)) = (mapping, history.as_deref()) {
+        ahead.revalidate(at, history);
+    }
+    memo::set_ahead(0);
+    j.ahead_asked = now;
+    j.ahead = ahead;
+}
+
+fn ask_pieces(pieces: &[(usize, usize)]) -> (Vec<(usize, usize)>, Vec<(usize, u16)>) {
     let (mut asked, mut written) = (Vec::new(), Vec::new());
     let mut i = 0;
     while i < pieces.len() {
@@ -463,15 +639,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         ask_run(&pieces[i..k], &mut asked, &mut written);
         i = k;
     }
-    note_hot(&written);
-    let ahead = AskedRanges::new(asked, watch_index());
-    let mut j = journal_mut();
-    j.ahead_asked = next_asking();
-    j.ahead = ahead;
-    let now = j.ahead_asked;
-    for (page, parts) in written {
-        j.note(page, parts, now);
-    }
+    (asked, written)
 }
 
 /// Since the last frame line: the kernel askings that took a millisecond
@@ -614,6 +782,7 @@ fn ask_early(every: std::time::Duration) {
 pub(crate) fn ask_ahead_done() {
     let mut j = journal_mut();
     if !j.kept {
+        memo::set_ahead(0);
         j.ahead.clear();
     }
 }
@@ -653,9 +822,13 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     // asking (ranges held, the journal's locks, noting the answer).
     IN_ASK_ONCE.with(|f| f.set(true));
     let began = std::time::Instant::now();
-    ask_once_end();
-    ask_ahead(ranges);
-    ask_rest(ranges);
+    if watch_spans() {
+        with_rest_order(ranges, true, ask_once_spans);
+    } else {
+        ask_once_end();
+        ask_ahead(ranges);
+        ask_rest(ranges);
+    }
     IN_ASK_ONCE.with(|f| f.set(false));
     ASK_ONCE[0].fetch_add(1, Ordering::Relaxed);
     ASK_ONCE[1].fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -718,16 +891,51 @@ fn with_rest_order(ranges: &[(usize, usize)], indexed: bool, ask: impl FnOnce(&[
 
 fn ask_rest_in_order(ranges: &[(usize, usize)]) {
     let _all = Asking::hold_all();
-    let mut ahead = {
+    let ahead = {
         let mut j = journal_mut();
+        memo::set_ahead(0);
         std::mem::take(&mut j.ahead)
     };
+    finish_asking(ranges, ahead, Vec::new(), None);
+}
+
+/// The caller sorted the pages by start. A combined reset also clears any
+/// dirty pages in its gaps. Hold those gaps, plus every original range the
+/// second pass can retry if its protection changes or a combined call fails.
+fn ask_once_spans(ranges: &[(usize, usize)]) {
+    let mapping = query_mapping();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut pieces = Vec::new();
+    for &(start, end) in ranges {
+        if start >= end {
+            continue;
+        }
+        let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+        match spans.last_mut() {
+            Some((_, past)) if first <= *past + AHEAD_GAP => *past = (*past).max(last),
+            _ => spans.push((first, last)),
+        }
+        if !published(start, end) {
+            pieces.push((first, last));
+        }
+    }
+    let _held = if spans.is_empty() { Asking::hold_all() } else { Asking::batch(spans) };
+    {
+        let mut j = journal_mut();
+        memo::set_ahead(0);
+        j.kept = false;
+        j.ahead.clear();
+    }
+    let (asked, written) = ask_pieces(&pieces);
+    finish_asking(ranges, AskedRanges::new(asked, watch_index()), written, Some(mapping));
+}
+
+fn finish_asking(ranges: &[(usize, usize)], mut ahead: AskedRanges, mut written: Vec<(usize, u16)>, mapping: Option<u64>) {
     // `ask_ahead` leaves a range that lies alone to `writes`, which asks
     // once per flush: with one asking for the submission that was every
     // such range asked again at each of its 70 flushes (run 76: 2,300
     // askings a frame with the switch on, as without it). They are asked
     // here, once; what is not write-watched stays with `writes`.
-    let mut written = Vec::new();
     ahead.ask_uncovered(ranges, |first, last| {
         let Some(pages) = kernel_written(first, last) else { return false };
         written.extend(pages);
@@ -744,8 +952,17 @@ fn ask_rest_in_order(ranges: &[(usize, usize)]) {
     for (page, parts) in written {
         j.note(page, parts, now);
     }
+    // Even an obsolete query reset the kernel's dirty bits: its writes
+    // above must reach the journal. Only its claim of coverage expires.
+    let history = mapping.map(|_| SPAN_PUBLICATION.lock().unwrap_or_else(|e| e.into_inner()));
+    if let (Some(at), Some(history)) = (mapping, history.as_deref()) {
+        ahead.revalidate(at, history);
+    }
     j.kept = !ahead.ranges.is_empty();
     j.ahead = ahead;
+    if j.kept {
+        memo::set_ahead(now);
+    }
 }
 
 /// The submission's one asking stands no longer: its refreshes are done,
@@ -753,6 +970,7 @@ fn ask_rest_in_order(ranges: &[(usize, usize)]) {
 pub(crate) fn ask_once_end() {
     let mut j = journal_mut();
     if j.kept {
+        memo::set_ahead(0);
         j.kept = false;
         j.ahead.clear();
     }
@@ -936,7 +1154,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// taken whole, or 0) does not hold, as [`writes`] would answer with nothing
 /// asked: the submission's asking covers the range, or its blocks are known
 /// by their bits. `false` if something would have to be asked.
-pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64], ranged: u64) -> bool {
+pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64], ranged: u64, remember: Option<memo::CopyKey>) -> bool {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     // The bits first, then the journal, as in `writes`.
     let known = published(start, end);
@@ -951,7 +1169,16 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
         return false;
     };
-    j.written.unchanged(first, taken, ranged)
+    let same = j.written.unchanged(first, taken, ranged);
+    if same && let Some(copy) = remember {
+        // The page comparisons and this clock are under the same journal
+        // read lock. No later journal write can have this asking's number.
+        let ahead = if known { 0 } else { memo::AHEAD.load(Ordering::Acquire) };
+        if known || ahead != 0 {
+            memo::remember(copy, start, end, base, ASKED.load(Ordering::Relaxed), ahead);
+        }
+    }
+    same
 }
 
 impl Tracked {
@@ -1557,6 +1784,7 @@ fn placeholder(block: usize) -> bool {
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
 /// committed: what was known of holes there is asked again.
 pub fn title_memory_allocated(at: usize, len: usize) {
+    mapping_changed(page_span(at, len));
     if len == 0 || !known_holes() {
         return;
     }
@@ -2761,6 +2989,8 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
 /// again - and are, the pages noted written, which also has the next check
 /// guard the new view ([`cover`]).
 pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
+    // Section offsets do not identify every virtual alias.
+    mapping_changed((0, usize::MAX));
     if !view_guard() {
         return;
     }
@@ -2788,6 +3018,7 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
 /// ([`views_mapped`]). What is guarded of its pages at other views is opened,
 /// and not guarded again before the change is done ([`Remapping`]).
 pub fn title_memory_splitting(at: usize, len: usize) {
+    mapping_changed((0, usize::MAX));
     let others: Vec<usize> = elsewhere(at, len).into_iter().flat_map(|(_, others)| others).collect();
     if others.is_empty() {
         return;
@@ -3054,8 +3285,61 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// The title is about to free or decommit memory of its own,
 /// `[at, at + len)`, or with no length the whole allocation at `at`: what
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
-/// of the next memory at the address.
-pub fn title_memory_freed(at: usize, len: usize) {
+/// of the next memory at the address. Hold the return value across the
+/// actual free so a reset during the change cannot publish old coverage.
+pub fn title_memory_freed(at: usize, len: usize) -> impl Drop {
+    let freeing = if watch_spans() || cfg!(test) {
+        // MEM_RELEASE names the base and passes zero bytes. Windows can
+        // still tell us the reservation's extent before the actual free.
+        let since = SPAN_MAPPING.load(Ordering::Acquire);
+        let first = at / PAGE;
+        let end = if len == 0 { allocation_end(at, at) } else { at.saturating_add(len) };
+        let pending = (first, if len == 0 { usize::MAX } else { end.div_ceil(PAGE) });
+        let mut history = SPAN_PUBLICATION.lock().unwrap_or_else(|e| e.into_inner());
+        let pages = if at < end && (len != 0 || history.unchanged(since, first, first + 1)) {
+            (first, end.div_ceil(PAGE))
+        } else {
+            pending
+        };
+        // A simultaneous release/reallocation at the base can change the
+        // size actually freed. Until the syscall returns, keep that whole
+        // possible extent out of newly published results.
+        history.freeing.push(pending);
+        history.changed(pages);
+        Some(FreeSpan { pages, pending, since: history.number })
+    } else {
+        memo::mapping_changed();
+        None
+    };
+    let guard = Freeing(freeing);
+    forget_freed(at, len);
+    guard
+}
+
+// Held across VirtualFree, without holding a mutex during the system call.
+// A reset starting after the first notification can still see the old pages.
+struct FreeSpan {
+    pages: (usize, usize),
+    pending: (usize, usize),
+    since: u64,
+}
+
+struct Freeing(Option<FreeSpan>);
+
+impl Drop for Freeing {
+    fn drop(&mut self) {
+        if let Some(FreeSpan { pages, pending, since }) = self.0.take() {
+            let mut history = SPAN_PUBLICATION.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(i) = history.freeing.iter().position(|&r| r == pending) {
+                history.freeing.swap_remove(i);
+            }
+            let replaced = pages != pending && history.changed_since(since, pages.0, pages.0 + 1);
+            history.changed(if replaced { pending } else { pages });
+        }
+    }
+}
+
+fn forget_freed(at: usize, len: usize) {
     crate::shadow::write_combined_freed(at, len);
     let mut g = guards();
     let first = at / BLOCK;
@@ -3101,6 +3385,7 @@ fn allocation_end(at: usize, inside: usize) -> usize {
     let mut end = at;
     let mut next = ask(inside.max(at));
     while let Some(to) = next {
+        if to <= end { break; }
         end = to;
         next = ask(to);
     }
@@ -3110,6 +3395,7 @@ fn allocation_end(at: usize, inside: usize) -> usize {
 /// Tells what keeps track of what title memory shows; the guards, with no
 /// block of the range known unmapped.
 fn title_memory_changed(at: usize, len: usize) -> std::sync::MutexGuard<'static, Guards> {
+    mapping_changed(page_span(at, len));
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
@@ -3244,6 +3530,7 @@ pub fn soft_view_guards() -> [u64; 2] {
 /// the view is there (as [`title_memory_remapped`] is), with the runtime's
 /// lock on its views held.
 pub fn title_memory_made_real(at: usize, len: usize) {
+    mapping_changed(page_span(at, len));
     if len == 0 {
         return;
     }
@@ -3450,6 +3737,7 @@ mod parts_tests {
     #[test]
     fn the_parts_of_a_page_written_since_it_was_taken() {
         let mut j = Journal {
+            memo_writes: None,
             written: Epochs::new(false),
             parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
             ahead: AskedRanges::EMPTY,
@@ -3561,6 +3849,125 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    #[test]
+    fn span_holds_let_an_unrelated_worker_through_until_publication() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let base = usize::MAX / 4;
+        let spans = vec![(base, base + 4), (base + 20, base + 24)];
+        for first in base - 1..base + 26 {
+            for last in first + 1..base + 28 {
+                assert_eq!(overlaps_spans(&spans, first, last), spans.iter().any(|&(a, b)| a < last && first < b));
+            }
+        }
+        std::thread::scope(|scope| {
+            let batch = Asking::batch(spans);
+            let (ready, started) = mpsc::channel();
+            let (entered, overlap) = mpsc::channel();
+            scope.spawn(move || {
+                ready.send(()).unwrap();
+                let _range = Asking::hold(base + 22, base + 23);
+                entered.send(()).unwrap();
+            });
+            started.recv().unwrap();
+            let (entered, gap) = mpsc::channel();
+            scope.spawn(move || {
+                let _range = Asking::hold(base + 4, base + 20);
+                entered.send(()).unwrap();
+            });
+            let unrelated = gap.recv_timeout(Duration::from_secs(5));
+            let still_waiting = overlap.try_recv();
+            drop(batch);
+            assert!(unrelated.is_ok());
+            assert_eq!(still_waiting, Err(mpsc::TryRecvError::Empty));
+            overlap.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+    }
+
+    #[test]
+    fn span_resets_record_gap_writes_retry_mixed_ranges_and_expire_on_remap() {
+        use windows_sys::Win32::System::Memory::MEM_DECOMMIT;
+        // SAFETY: two fresh private allocations of ours, freed below.
+        let (p, plain) = unsafe {
+            (VirtualAlloc(std::ptr::null(), 3 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) as usize,
+             VirtualAlloc(std::ptr::null(), PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize)
+        };
+        assert_ne!(p, 0);
+        assert_ne!(plain, 0);
+        let middle = p + PAGE;
+        let page = middle / PAGE;
+        let before = next_asking();
+        // SAFETY: the middle page is committed and writable.
+        unsafe { (middle as *mut u8).write_volatile(1) };
+        ask_once_spans(&[(p, p + PAGE), (p + 2 * PAGE, p + 3 * PAGE)]);
+        let epoch = || journal().written.records(page, page + 1)[0].1;
+        assert!(epoch() > before, "resetting the gap must journal its write");
+
+        let before = next_asking();
+        // SAFETY: our committed middle page.
+        unsafe { (middle as *mut u8).write_volatile(2) };
+        let ranges = [(plain, plain + PAGE), (p, p + 4 * PAGE), (middle + 8, middle + 24)];
+        with_rest_order(&ranges, true, ask_once_spans);
+        let copied = epoch();
+        assert!(copied > before, "a failed cross-reservation query must retry the watched subrange");
+        assert!(writes(plain, plain + 8, false).is_none());
+        assert!(asked(p, p + 4 * PAGE).is_none());
+
+        let freeing = title_memory_freed(middle, PAGE);
+        // The old page is still committed. Windows accepts this query,
+        // but it cannot stand across the kernel call that follows.
+        ask_once_spans(&[(middle, middle + PAGE)]);
+        assert!(asked(middle, middle + 8).is_none());
+        // SAFETY: decommit our page within our retained reservation.
+        unsafe {
+            assert_ne!(VirtualFree(middle as *mut _, PAGE, MEM_DECOMMIT), 0);
+        }
+        drop(freeing);
+        assert!(asked(middle, middle + 8).is_none());
+        // SAFETY: recommit and write our page.
+        unsafe {
+            assert_eq!(VirtualAlloc(middle as *const _, PAGE, MEM_COMMIT, PAGE_READWRITE) as usize, middle);
+            (middle as *mut u8).write_volatile(3);
+        }
+        title_memory_allocated(middle, PAGE);
+        assert!(asked(middle, middle + 8).is_none());
+        let (_, writes) = writes(middle, middle + 8, false).expect("recommitted write-watched page");
+        assert!(writes.iter().any(|&(p, at)| p == page && at > copied));
+        ask_once_end();
+        // SAFETY: both reservations belong to this test.
+        unsafe {
+            VirtualFree(p as *mut _, 0, MEM_RELEASE);
+            VirtualFree(plain as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn span_grouping_survives_unrelated_allocations_and_rebuilds_a_changed_flush() {
+        // SAFETY: a fresh write-watched reservation owned by this test.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), 3 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+        assert_ne!(p, 0);
+        let middle = p + PAGE;
+        let ranges = [(p, p + PAGE), (p + 2 * PAGE, p + 3 * PAGE)];
+        ask_once_spans(&ranges);
+        let original = asked(middle, middle + 8).expect("group covered its gap").0;
+        mapping_changed(page_span(p + 8 * PAGE, PAGE));
+        assert!(asking_stands());
+        assert_eq!(asked(middle, middle + 8).unwrap().0, original);
+
+        mapping_changed(page_span(middle, PAGE));
+        assert!(asked(middle, middle + 8).is_none());
+        // This is the per-flush fallback, including the kept check the
+        // caller can make before building its list of ranges.
+        assert!(!asking_stands());
+        ask_ahead_scoped(&ranges, true);
+        assert!(asked(middle, middle + 8).is_some_and(|(n, _)| n > original));
+        title_memory_allocated(middle, PAGE);
+        assert!(asked(middle, middle + 8).is_none(), "fallback coverage must expire too");
+        ask_ahead_done();
+        // SAFETY: our reservation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
 
     // no views are registered in these tests, so `elsewhere` adds nothing and
     // only the widened range of the write itself is left.
@@ -4320,6 +4727,30 @@ mod tests {
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
         assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
         drop_views(section, &[guarded, other], SIZE);
+    }
+
+    #[test]
+    fn a_memoized_partial_poll_expires_on_an_alias_write_republication_and_remap() {
+        let (section, at, alias) = two_views(PAGE);
+        let (from, to) = (at + 8, at + 48);
+        let key = || super::memo::CopyKey::new(u64::MAX, 1);
+        let (first, _) = writes(at, at + PAGE, true).expect("guarded view");
+        let poll = |ranged| super::nothing_new(from, to, at / PAGE, &[0], ranged, Some(key()));
+        let hit = || super::memo::holds(key(), from, to, at / PAGE);
+        // Other tests can invalidate a stripe or the mapping generation.
+        let confirmed = |ranged| (0..128).any(|_| poll(ranged) && hit());
+        assert!(!poll(0), "first touch");
+        assert!(confirmed(first));
+        assert!(!super::memo::holds(key(), from, to + 1, at / PAGE), "uncopied suffix");
+        // SAFETY: our other view of the same writable section.
+        unsafe { ((alias + 10) as *mut u8).write_volatile(7) };
+        assert!(!hit(), "the alias removed the published guard");
+        let (second, _) = writes(at, at + PAGE, true).expect("guarded again");
+        assert!(!hit() && !poll(first), "its new journal entry outlives the guard change");
+        assert!(confirmed(second));
+        super::title_memory_unmapping(at, PAGE);
+        assert!(!hit(), "the mapping was revoked");
+        drop_views(section, &[at, alias], PAGE);
     }
 
     /// A view of guarded pages is mapped anew: it is writable, so the

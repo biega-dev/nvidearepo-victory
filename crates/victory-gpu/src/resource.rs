@@ -1327,10 +1327,16 @@ pub(crate) fn held_only() -> bool {
 
 /// The first level a placed texture's view shows: of views of one 2D
 /// texture (the others show whole textures). After victory-amd 4436f8f1.
-pub(crate) fn first_mip(view: &[u32]) -> u32 {
+pub(crate) fn first_mip(resource: &[u32; 14], view: &[u32]) -> u32 {
     const TEXTURE_2D_VIEW: u32 = 4;
+    const TEXTURE_2D_ARRAY_VIEW: u32 = 5;
     match *view {
         [_, TEXTURE_2D_VIEW, _, _, first, ..] => first.min(15),
+        // A 2D array view of the only slice has the same mip range as a
+        // 2D view. Word 7 of the resource packs the layer count below
+        // the mip count. Keep whole resources with multiple layers.
+        [_, TEXTURE_2D_ARRAY_VIEW, _, _, first, _, 0, 1 | u32::MAX, ..]
+            if resource[0] == 3 && resource[7] as u16 == 1 => first.min(15),
         _ => 0,
     }
 }
@@ -1346,13 +1352,33 @@ pub(crate) fn read_from(layout: &victory_formats::texture::Layout, first: u32) -
     if layout.bytes_from(first) < layout.size { first } else { 0 }
 }
 
+/// Extra mip levels to omit from a placed block-compressed texture on the
+/// card. VICTORY_TEXTURE_SKIP_LEVELS defaults to 0 and accepts up to 4.
+/// VICTORY_TEXTURE_SKIP_MIN is the shortest eligible long side in texels
+/// (1024 by default, at least 64). The title keeps its original description
+/// and memory. Only the retained levels cross the bus for shaders to read.
+#[cfg(windows)]
+fn texture_skip() -> (u32, u64) {
+    static SKIP: std::sync::OnceLock<(u32, u64)> = std::sync::OnceLock::new();
+    *SKIP.get_or_init(|| {
+        let levels = std::env::var("VICTORY_TEXTURE_SKIP_LEVELS").ok()
+            .and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0).min(4);
+        let min_side = std::env::var("VICTORY_TEXTURE_SKIP_MIN").ok()
+            .and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1024).max(64);
+        if levels > 0 {
+            tracing::info!(levels, min_side, "lower detail for large block-compressed textures");
+        }
+        (levels, min_side)
+    })
+}
+
 /// The level a host copy begins at for views that start at `first`: one the
 /// host can have as a texture's level 0 ([`read_from`]; block-compressed
 /// formats in whole blocks).
 #[cfg(windows)]
-fn base_level(desc: &ResourceDesc, first: u32) -> u32 {
+fn base_level(desc: &ResourceDesc, mut first: u32, (skip, min_side): (u32, u64)) -> u32 {
     const TEXTURE_2D: u32 = 3;
-    if first == 0
+    if (first == 0 && skip == 0)
         || !fills(desc)
         || desc.dimension != TEXTURE_2D
         || desc.depth_or_array_size != 1
@@ -1369,6 +1395,16 @@ fn base_level(desc: &ResourceDesc, first: u32) -> u32 {
         return 0;
     }
     let block = u64::from(layout.desc.block.max(1));
+    if block > 1 {
+        let long_side = desc.width.max(u64::from(desc.height));
+        for _ in 0..skip {
+            // Keep two levels and only shift within the validated layout.
+            if first >= u32::from(desc.mip_levels).saturating_sub(2) || (long_side >> first) < min_side {
+                break;
+            }
+            first += 1;
+        }
+    }
     let mut base = read_from(layout, first).min(u32::from(desc.mip_levels) - 1);
     let whole = |side: u64| side != 0 && side.is_multiple_of(block);
     while base > 0 && !(whole(desc.width >> base) && whole(u64::from(desc.height) >> base)) {
@@ -1434,10 +1470,16 @@ pub(crate) fn want_level(this: This, first: u32) {
         r.host.wanted.fetch_min(first, Relaxed);
         return;
     };
-    if host.base == 0 || host.base <= base_level(&r.desc, first) {
+    // The copy already satisfies the earliest request seen under this lock.
+    // With detail reduced even a view from zero can have a nonzero host
+    // base. Repeated bindings of that view need no new layout calculation.
+    if host.base == 0 || first >= r.host.wanted.load(Relaxed) {
         return;
     }
     r.host.wanted.store(first, Relaxed);
+    if host.base <= base_level(&r.desc, first, texture_skip()) {
+        return;
+    }
     // Under the lock, as in `let_go_idle`.
     crate::texture::unstage(this);
     r.host.grown.store(true, Relaxed);
@@ -1755,7 +1797,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
             let first = wanted.min(viewed);
             if first != u32::MAX {
-                base = base_level(&r.desc, first);
+                base = base_level(&r.desc, first, texture_skip());
             }
         }
         let texture = match texture {
@@ -2057,10 +2099,20 @@ pub(crate) fn room_percent() -> u64 {
 pub(crate) fn room_line(budget: u64) -> u64 {
     static SET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *SET.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_ROOM_PERCENT").is_some()) {
-        budget / 100 * room_percent()
-    } else {
-        line_for(budget)
+        return budget / 100 * room_percent();
     }
+    // VICTORY_FG_ROOM_PERCENT is the automatic reservation, separate from
+    // the explicit texture budget above. A rejected 6x request on the 3070
+    // had kept 20% for a feature that allocated no frames.
+    static FG: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let fg = *FG.get_or_init(|| std::env::var("VICTORY_FG_ROOM_PERCENT").ok()
+        .and_then(|v| v.trim().parse::<u64>().ok()).map(|n| n.clamp(50, 97)));
+    fg_room_line(budget, fg, fg.is_some() && crate::streamline::framegen_ruled_out())
+}
+
+#[cfg(any(windows, test))]
+fn fg_room_line(budget: u64, percent: Option<u64>, ruled_out: bool) -> u64 {
+    if let Some(percent) = percent.filter(|_| !ruled_out) { budget / 100 * percent } else { line_for(budget) }
 }
 
 /// The budget less what is left free for the host's own needs that are
@@ -4896,6 +4948,14 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(line_for(0), 0);
     }
 
+    #[test]
+    fn automatic_generation_headroom_is_released_if_the_driver_rejects_it() {
+        let budget = 7_000u64 << 20;
+        assert_eq!(fg_room_line(budget, Some(80), false), budget / 100 * 80);
+        assert_eq!(fg_room_line(budget, Some(80), true), line_for(budget));
+        assert_eq!(fg_room_line(budget, None, false), line_for(budget));
+    }
+
     /// The room kept for render targets goes once the world's targets are
     /// made and have stopped growing, and comes back when they grow again.
     #[test]
@@ -4937,6 +4997,61 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(room(0, 2900, 2900), 0);
     }
 
+    #[test]
+    fn single_slice_array_views_use_the_same_first_mip_as_2d_views() {
+        let mut words = [3, 0, 0, 0, 4096, 0, 512, 0xd_0001, 98, 1, 0, 0, 0, 0];
+        let mut array = [98, 5, 5768, 0, 3, 4, 0, 1, 0, 0];
+        let plain = [98, 4, 5768, 0, 3, 4, 0, 0, 0, 0];
+        assert_eq!(first_mip(&words, &plain), 3);
+        assert_eq!(first_mip(&words, &array), first_mip(&words, &plain));
+        array[7] = u32::MAX;
+        assert_eq!(first_mip(&words, &array), 3);
+        array[6] = 1;
+        assert_eq!(first_mip(&words, &array), 0);
+        array[6] = 0;
+        words[7] = 0xd_0002;
+        for slices in [1, 2, u32::MAX] {
+            array[7] = slices;
+            assert_eq!(first_mip(&words, &array), 0);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn texture_skip_retains_valid_mips_of_large_compressed_textures() {
+        let bc = texture(4096, 512, 98, 13);
+        assert_eq!(base_level(&bc, 0, (0, 2048)), 0);
+        assert_eq!(base_level(&bc, 1, (0, 2048)), 1);
+        assert_eq!(base_level(&bc, 0, (1, 2048)), 1);
+        assert_eq!(base_level(&bc, 0, (4, 2048)), 2);
+        assert_eq!(base_level(&bc, 1, (1, 2048)), 2);
+        let host = bc.from_level(base_level(&bc, 0, (2, 2048)));
+        assert_eq!((host.width, host.height, host.mip_levels, host.format), (1024, 128, 11, 98));
+        assert_eq!((bc.width, bc.height, bc.mip_levels), (4096, 512, 13));
+
+        assert_eq!(base_level(&ResourceDesc { mip_levels: 3, ..bc }, 0, (4, 64)), 1);
+        // A malformed view's first mip is bounded by the layout before indexing it.
+        assert_eq!(base_level(&bc, u32::MAX, (4, 64)), base_level(&bc, u32::MAX, (0, 64)));
+        for desc in [
+            texture(1024, 1024, 98, 11),
+            texture(4096, 512, 28, 13),
+            ResourceDesc { depth_or_array_size: 2, ..bc },
+            ResourceDesc { dimension: TEXTURE_3D, ..bc },
+            ResourceDesc { dimension: 2, height: 1, ..bc },
+            ResourceDesc { sample_count: 4, ..bc },
+            ResourceDesc { flags: 1, ..bc },
+            ResourceDesc { flags: 2, ..bc },
+            ResourceDesc { flags: 4, ..bc },
+            ResourceDesc { layout: 0x115, ..bc },
+            ResourceDesc { mip_levels: 0, ..bc },
+            ResourceDesc { mip_levels: 2, ..bc },
+            // A level 0 of 2049 texels would end in a partial BC block.
+            ResourceDesc { width: 4098, ..bc },
+        ] {
+            assert_eq!(base_level(&desc, 0, (1, 2048)), 0, "{desc:?}");
+        }
+    }
+
     /// A placed texture viewed from a later level has a host copy of that
     /// and the smaller levels; a view from an earlier one gets another.
     #[cfg(windows)]
@@ -4955,19 +5070,28 @@ float4 lit() : SV_Target { return 1.0; }
         // SAFETY: memory of our own that stays.
         let at = unsafe { VirtualAlloc(std::ptr::null(), whole as usize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
         let texture = texture_at(at as u64, &desc).unwrap();
+        let title = resource(texture).desc;
+        let from_view = |first| {
+            let base = base_level(&title, first, texture_skip());
+            let host = title.from_level(base);
+            (base, host.width, host.height, host.mip_levels)
+        };
         want_level(texture, 2);
         let copy = host_copy(texture).unwrap();
         // SAFETY: a live texture.
         let d = unsafe { copy.texture.GetDesc() };
-        assert_eq!((copy.base, d.Width, d.Height, d.MipLevels), (2, 64, 64, 7));
+        assert_eq!((copy.base, d.Width, d.Height, d.MipLevels), from_view(2));
+        want_level(texture, 2);
         want_level(texture, 5);
         assert_eq!(host_copy(texture).unwrap().serial, copy.serial);
         want_level(texture, 0);
         let more = host_copy(texture).unwrap();
         // SAFETY: as above.
         let d = unsafe { more.texture.GetDesc() };
-        assert_eq!((more.base, d.Width, d.MipLevels), (0, 256, 9));
-        assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!((more.base, d.Width, d.Height, d.MipLevels), from_view(0));
+        let grew = more.base < copy.base;
+        assert_eq!(more.serial != copy.serial, grew);
+        assert_eq!(more.grown.load(std::sync::atomic::Ordering::Relaxed), grew);
     }
 
     /// Fork PR #1336 (CwWwWwW, f8fab6fb): the source a placed view aliases

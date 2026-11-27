@@ -742,6 +742,7 @@ pub(crate) fn save(now: bool) {
             // the sampler tables: blocks, slots, stages with a table, stages
             // left static, draws dropped for want of room in the heap.
             sampler_tables = ?crate::pipeline::host::sampler_stats(),
+            sampler_no_room = crate::pipeline::host::sampler_no_room(),
             "host pipeline library saved"
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),

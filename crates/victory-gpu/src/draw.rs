@@ -2577,7 +2577,7 @@ impl State {
                         let texture = crate::resource::host_resource(resource);
                         let title_fills = texture.is_some_and(crate::texture::title_written);
                         let first = match (&placed, &view) {
-                            (Some(_), View::Placed(_, _, desc)) => crate::resource::first_mip(desc),
+                            (Some(_), View::Placed(_, words, desc)) => crate::resource::first_mip(words, desc),
                             _ => 0,
                         };
                         if let (Some(sync), Some(copy)) = (sync.as_deref_mut(), crate::resource::host_copy(resource)) {
@@ -2775,7 +2775,7 @@ impl State {
             let mut first = 0;
             if let View::Placed(false, desc_words, desc) = &view {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-                first = crate::resource::first_mip(desc);
+                first = crate::resource::first_mip(desc_words, desc);
                 let len = crate::resource::placed_bytes_from(desc_words, first).unwrap_or(1);
                 if crate::texture::mapped_bytes(address as *const u8, len as usize) == 0 {
                     // Not there (yet): what the console reads there is no
@@ -3343,7 +3343,7 @@ impl State {
                     // too: what is written there is told of there alone.
                     let elsewhere = crate::inplace::shown_elsewhere(at as usize & !0xffff, (at + len) as usize);
                     let first = heap.handle(index).and_then(crate::descriptor::view).map_or(0, |view| match view {
-                        View::Placed(false, _, desc) => crate::resource::first_mip(&desc),
+                        View::Placed(false, words, desc) => crate::resource::first_mip(&words, &desc),
                         _ => 0,
                     });
                     tracing::warn!(
@@ -3365,7 +3365,7 @@ impl State {
             let held = rest(1, || heap.handle(index).and_then(crate::descriptor::view));
             if let Some(View::Placed(false, resource, desc)) = &held {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-                let first = crate::resource::first_mip(desc);
+                let first = crate::resource::first_mip(resource, desc);
                 let len = crate::resource::placed_bytes_from(resource, first).unwrap_or(1);
                 let mapped = timed(1, || crate::texture::mapped_bytes(address as *const u8, len as usize));
                 if mapped == 0 {
@@ -3525,7 +3525,7 @@ impl State {
             let tabled = rest(6, || crate::texture::is_staged(resource));
             // The host copy holds these very bytes: nothing to upload.
             let first = match (&placed, &view) {
-                (Some(_), Some(View::Placed(_, _, desc))) => crate::resource::first_mip(desc),
+                (Some(_), Some(View::Placed(_, words, desc))) => crate::resource::first_mip(words, desc),
                 _ => 0,
             };
             let same = !tabled && timed(2, || crate::texture::unchanged(resource, first));
@@ -5942,10 +5942,10 @@ impl RecordHash {
     }
 }
 
-fn readable(list: &HostList, kind: ResourceType, view: &View) {
+fn readable(list: &HostList, kind: ResourceType, original: &View) {
     const UNORDERED_ACCESS: u32 = 0x8;
-    let placed = crate::descriptor::host::placed_texture(view);
-    let view = placed.as_ref().unwrap_or(view);
+    let placed = crate::descriptor::host::placed_texture(original);
+    let view = placed.as_ref().unwrap_or(original);
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
     if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
@@ -5980,8 +5980,8 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                 // (A texture the title writes: no target, depth or unordered
                 // access, `crate::texture::title_written`.)
                 // Of a texture the title placed, the levels the view shows.
-                let first = match (&placed, view) {
-                    (Some(_), View::Shader(_, Some(desc))) => crate::resource::first_mip(desc),
+                let first = match (&placed, original) {
+                    (Some(_), View::Placed(_, words, desc)) => crate::resource::first_mip(words, desc),
                     _ => 0,
                 };
                 crate::texture::upload_from(list, *resource as This, first);

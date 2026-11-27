@@ -44,8 +44,14 @@ param(
     [switch]$Ryzen3700X,
     # Use the Ryzen profile with the new command-list, upload and texture-budget paths.
     [switch]$RyzenPreparo,
+    # Ryzen command preparation plus GPU texture detiling for eligible uploads.
+    [switch]$RyzenTexturas,
+    # Batch light refreshes on Ryzen and track concurrent write-watch requests by range.
+    [switch]$RyzenLotes,
     [hashtable]$More = @{}
 )
+if ($RyzenLotes) { $RyzenTexturas = $true }
+if ($RyzenTexturas) { $RyzenPreparo = $true }
 if ($RyzenPreparo) { $Ryzen3700X = $true }
 $repo = Split-Path $PSScriptRoot -Parent
 # What the F1 menu saved: its own choices (VICTORY_MENU_...) stand in for this script's options, and its
@@ -145,6 +151,19 @@ if ($RyzenPreparo) {
     $settings.VICTORY_TARGETS_PEAK_ROOM = '1'
     $settings.VICTORY_TEXTURE_QUEUE_DENSE = '1'
 }
+if ($RyzenTexturas) {
+    $settings.VICTORY_REFRESH_LOCAL_WORK = '1'
+    $settings.VICTORY_CARD_COMPARE_RUNS = '1'
+    $settings.VICTORY_REFRESH_SPLIT = '0'
+    $settings.VICTORY_GPU_DETILE = '1'
+}
+if ($RyzenLotes) {
+    $settings.VICTORY_WIDE_CHUNK = '4'
+    $settings.VICTORY_REFRESH_AVX2 = '1'
+    $settings.VICTORY_WATCH_SPANS = '1'
+    # The optional F1 texture setting only affects levels at least this large.
+    $settings.VICTORY_TEXTURE_SKIP_MIN = '2048'
+}
 if (-not $SeriesS) {
     if ($Res -eq '1440') { $settings.VICTORY_NATIVE_1440P = '1' }
     elseif ($Res -eq '1080to1440') { $settings.VICTORY_RENDER_1080P = '1' }
@@ -161,7 +180,11 @@ if ($Dlss -ne 'off') {
         # Frame generation takes 1.5 to 2 GB of the card's memory, which the layer otherwise fills with textures up
         # to nine tenths of its budget (on a 12 GB card it then ran out: no generated frames). On from the start, it
         # is left a fifth of the budget; ready but off, a little less is held back.
-        if ($settings.VICTORY_FRAMEGEN -eq '1') { $settings.VICTORY_TEXTURE_ROOM_PERCENT = if ($FrameGen) { '80' } else { '86' } }
+        if ($settings.VICTORY_FRAMEGEN -eq '1') {
+            $room = if ($FrameGen) { '80' } else { '86' }
+            if ($RyzenPreparo) { $settings.VICTORY_FG_ROOM_PERCENT = $room }
+            else { $settings.VICTORY_TEXTURE_ROOM_PERCENT = $room }
+        }
     } else {
         Write-Host "No NVIDIA files in ${sl}: running without DLSS and frame generation. Get-NVIDIA-DLSS.cmd in the"
         Write-Host "repository folder fetches them from NVIDIA once (about 70 MB); VICTORY_STREAMLINE_DIR names another folder."
@@ -183,7 +206,8 @@ $settings.VICTORY_MENU_FRAMEGEN = if ($settings.VICTORY_FRAMEGEN -eq '1') { [str
 $settings.VICTORY_MENU_FPS = [string]$fpsWanted
 $settings.VICTORY_MENU_FILE = $menuFile
 $settings.VICTORY_MENU_PLAY = $MyInvocation.MyCommand.Path
-$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($NoFrameGenReady) { ' -NoFrameGenReady' })$(if ($Fast) { ' -Fast' })$(if ($RyzenPreparo) { ' -RyzenPreparo' } elseif ($Ryzen3700X) { ' -Ryzen3700X' })"
+$ryzenArg = if ($RyzenLotes) { ' -RyzenLotes' } elseif ($RyzenTexturas) { ' -RyzenTexturas' } elseif ($RyzenPreparo) { ' -RyzenPreparo' } elseif ($Ryzen3700X) { ' -Ryzen3700X' }
+$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($NoFrameGenReady) { ' -NoFrameGenReady' })$(if ($Fast) { ' -Fast' })$ryzenArg"
 
 $victory = Join-Path $repo "target\$Build\victory.exe"
 if (-not (Test-Path $victory)) {
@@ -204,9 +228,22 @@ Get-ChildItem Env:VICTORY_* -ErrorAction SilentlyContinue | Where-Object { $_.Na
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
 
 $logs = Join-Path $env:LOCALAPPDATA 'victory\logs'; New-Item -ItemType Directory -Force $logs | Out-Null
-$log = Join-Path $logs ('foxhound-{0:yyyyMMdd-HHmmss}.log' -f (Get-Date))
+$log = Join-Path $logs ('foxhound-{0:yyyyMMdd-HHmmss-fff}-{1}.log' -f (Get-Date), $PID)
+$header = "# console=$console build=$Build switches: " + (($settings.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ' ')
+if ($RyzenPreparo -and !$settings.ContainsKey('VICTORY_LOG_FILE')) {
+    # Write tracing events directly to this run's file. On repeated F1 restarts
+    # forwarding each line through PowerShell also copied it to earlier logs.
+    [IO.File]::WriteAllText($log, $header + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+    $env:VICTORY_LOG_FILE = $log
+    if (!$settings.ContainsKey('VICTORY_LOG_CONSOLE_WARN')) { $env:VICTORY_LOG_CONSOLE_WARN = '1' }
+    Write-Host "Log: $log"
+    Push-Location $repo
+    try { & $victory run $Exe --console $console --execute }
+    finally { Pop-Location }
+    return
+}
 $writer = [IO.StreamWriter]::new($log, $false, [Text.UTF8Encoding]::new($false)); $writer.AutoFlush = $true
-$writer.WriteLine("# console=$console build=$Build switches: " + (($settings.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ' '))
+$writer.WriteLine($header)
 Write-Host "Log: $log"
 Push-Location $repo   # victory.toml is read from here
 try { & $victory run $Exe --console $console --execute 2>&1 | ForEach-Object { $line = "$_"; $writer.WriteLine($line); $line } }

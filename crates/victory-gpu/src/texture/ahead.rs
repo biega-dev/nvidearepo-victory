@@ -94,8 +94,9 @@ pub(crate) fn in_flight() -> usize {
 /// copy had run, the longest; askings turned down; waits of lists.
 static STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
-/// Takes the first upload of `resource`'s levels from `first` on, `there` of
-/// whose bytes are mapped (`u64::MAX`: not known). `None`: the list's.
+/// Takes the first upload of `resource`'s levels from `first` on. `there` is
+/// the length of a wholly mapped view, or `u64::MAX` for a partial or unknown
+/// view. `None`: the list's.
 pub(crate) fn take(resource: This, first: u32, there: u64) -> Option<Taken> {
     if on() { claim(resource, first, there) } else { None }
 }
@@ -129,7 +130,8 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
         return turned_down();
     }
     super::PICKING.set(Some(there));
-    let staging = super::staging(resource, &copy, first);
+    // The COPY list can consume only the ordinary CPU-linear staging.
+    let staging = super::staging(resource, &copy, first, false);
     super::PICKING.set(None);
     let Some(staging) = staging.filter(|s| {
         !s.on_demand && s.first == s.level0 && !s.uploaded.load(Relaxed) && s.once.load(Relaxed)
@@ -137,9 +139,7 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
         copy.ahead.store(LISTED, Relaxed);
         return turned_down();
     };
-    if super::no_wait() && super::fill_unlocked() {
-        staging.expected.store(if there == u64::MAX { super::mapped_bytes(staging.memory, staging.read) } else { there }, Relaxed);
-    }
+    staging.expect_mapped(there);
     let job = Arc::new(Job { staging, copy, asked: std::time::Instant::now(), then: Mutex::new(Some(Vec::new())) });
     BYTES.fetch_add(job.staging.read as u64, Relaxed);
     {

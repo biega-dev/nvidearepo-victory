@@ -2346,6 +2346,12 @@ pub(crate) fn framegen_live() -> bool {
     FG_READY.load(Acquire) && SWAP_CHAIN_PROXIED.load(Acquire)
 }
 
+/// Before the adapter check finishes, keep the launcher's headroom. Once
+/// Streamline rules out frame generation those allocations will not be made.
+pub(crate) fn framegen_ruled_out() -> bool {
+    PLAN.get().is_some_and(|plan| !plan.framegen)
+}
+
 /// Asks frame generation off (0) or for `times` frames shown for each one rendered (2..6),
 /// from the next present on.
 pub(crate) fn set_framegen(times: u32) {
