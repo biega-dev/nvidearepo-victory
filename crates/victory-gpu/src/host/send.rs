@@ -22,6 +22,8 @@
 use super::*;
 use crate::shadow::Shadow;
 
+mod layout;
+
 pub(super) fn own() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_SEND_OWN").is_none_or(|v| v != "0"))
@@ -196,40 +198,26 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     // Runs of whole words of the copy: only those are pairs. (A byte beside
     // them in a word may be the card's.)
     let short = |&(a, b): &(usize, usize)| short(a, b - a);
-    let mut at = 0u64;
-    let mut copies = Vec::with_capacity(dirty.len());
-    for (_, ranges) in dirty {
-        let mut runs = Vec::new();
-        for &(a, b) in ranges.iter().filter(|r| !short(r)) {
-            runs.push((a, at, b - a));
-            at += ((b - a) as u64).next_multiple_of(16);
-        }
-        let words: usize = ranges.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
-        copies.push(Copy { runs, pairs: (at, words as u32) });
-        at += (words as u64 * 8).next_multiple_of(16);
-    }
+    let resources = dirty.iter().map(|(shadow, ranges)| (shadow.card_data() as usize, ranges.as_slice()));
+    let grouped = crate::asked_for!("VICTORY_SUBMIT_UPLOAD_BATCH");
+    let (at, copies, work) = if grouped {
+        layout::plan(resources)
+    } else {
+        layout::separate(resources)
+    };
     if at == 0 {
         return None;
     }
     let memory = memory(host, at)?;
     let mut moves: Vec<(usize, usize, usize)> = Vec::new();
-    let mut work: Vec<(usize, &[(usize, usize)], usize)> = Vec::new();
-    for ((shadow, ranges), copy) in dirty.iter().zip(&copies) {
+    for ((shadow, _), copy) in dirty.iter().zip(&copies) {
         let from = shadow.card_data() as usize;
         moves.extend(copy.runs.iter().map(|&(a, to, n)| (from + a, memory.data + to as usize, n)));
-        // (80,000 runs of some words a frame: in pieces of work.)
-        let mut to = memory.data + copy.pairs.0 as usize;
-        for ranges in ranges.chunks(RUNS_AT_A_TIME) {
-            let words: usize = ranges.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
-            if words > 0 {
-                work.push((from, ranges, to));
-                to += words * 8;
-            }
-        }
     }
+    let mapping = memory.data;
     let one = |i: usize| {
         let (from, ranges, to) = work[i];
-        let mut to = to as *mut [u32; 2];
+        let mut to = (mapping + to) as *mut [u32; 2];
         for &(a, b) in ranges.iter().filter(|r| short(r)) {
             for offset in (a..b).step_by(4) {
                 // SAFETY: inside the copy's mapping (its CPU side, which
@@ -244,11 +232,34 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
             }
         }
     };
-    crate::land::each_under(work.len(), &one);
-    STATS[0].fetch_add(moves.iter().map(|m| m.2 as u64).sum(), Ordering::Relaxed);
+    let bulk_bytes = moves.iter().map(|m| m.2 as u64).sum();
+    STATS[0].fetch_add(bulk_bytes, Ordering::Relaxed);
     STATS[1].fetch_add(moves.len() as u64, Ordering::Relaxed);
     STATS[2].fetch_add(copies.iter().map(|c| u64::from(c.pairs.1)).sum(), Ordering::Relaxed);
-    crate::shadow::copy_all(moves);
+    // The frozen CPU sides feed disjoint offsets in one upload mapping.
+    // Pack the scatter words and copy the long runs in one worker round.
+    // The card still reads every byte from this submission's own mapping.
+    // Wide projection tuning can write the source, so it keeps its order.
+    // A lone scatter job with less than a worker's share of bulk runs stays
+    // inline, as it did before; waking helpers for these stalls short lists.
+    let share_workers = work.len() > 1 || bulk_bytes >= layout::BULK_BYTES as u64;
+    if grouped && share_workers && !work.is_empty() && !moves.is_empty() && crate::aspect::target().is_none() {
+        let bulk = layout::bulk_parts(&moves);
+        crate::land::each_under(bulk.len() + work.len(), &|i| {
+            if let Some(part) = bulk.get(i) {
+                for &(src, dst, n) in part {
+                    // SAFETY: each range is inside the shadow and its disjoint
+                    // upload slot; both are held until all workers return.
+                    unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, n) };
+                }
+            } else {
+                one(i - bulk.len());
+            }
+        });
+    } else {
+        crate::land::each_under(work.len(), &one);
+        crate::shadow::copy_all(moves);
+    }
     STATS[3].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
     Some(Own { memory, copies })
 }

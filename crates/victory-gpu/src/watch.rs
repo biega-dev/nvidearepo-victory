@@ -120,8 +120,8 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
 }
 
 /// With VICTORY_WATCH_INDEX=1, refreshes look up the journal's page ranges
-/// by address and the guards check clean blocks a word at a time. Both are
-/// CPU metadata; the same title bytes are read and sent to the card.
+/// by address, ask about containing ranges first and check clean blocks a
+/// word at a time. This reorders CPU metadata only.
 fn watch_index() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::switch::on("VICTORY_WATCH_INDEX"))
@@ -189,6 +189,19 @@ impl AskedRanges {
 
     fn clear(&mut self) {
         self.ranges.clear();
+    }
+
+    /// A failed kernel query leaves its contained ranges to be asked for.
+    fn ask_uncovered(&mut self, ranges: &[(usize, usize)], mut ask: impl FnMut(usize, usize) -> bool) {
+        for &(start, end) in ranges {
+            if start >= end || published(start, end) {
+                continue;
+            }
+            let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+            if !self.covers(first, last) && ask(first, last) {
+                self.insert_uncovered(first, last);
+            }
+        }
     }
 }
 
@@ -676,6 +689,28 @@ pub(crate) fn ask_line(frames: f64) {
 /// [`ask_once`] after its [`ask_ahead`]: what that left to `writes`, and the
 /// asking stands.
 fn ask_rest(ranges: &[(usize, usize)]) {
+    with_rest_order(ranges, watch_index(), ask_rest_in_order);
+}
+
+/// Order the queries before taking ASKING. Keep each original range: two
+/// overlapping ranges can cross a reservation boundary if joined.
+fn with_rest_order(ranges: &[(usize, usize)], indexed: bool, ask: impl FnOnce(&[(usize, usize)])) {
+    let key = |&(start, end): &(usize, usize)| (start / PAGE, std::cmp::Reverse(end.div_ceil(PAGE)));
+    if !indexed || ranges.is_sorted_by_key(key) {
+        return ask(ranges);
+    }
+    thread_local! {
+        static ORDERED: std::cell::RefCell<Vec<(usize, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    ORDERED.with_borrow_mut(|ordered| {
+        ordered.clear();
+        ordered.extend_from_slice(ranges);
+        ordered.sort_unstable_by_key(key);
+        ask(ordered);
+    });
+}
+
+fn ask_rest_in_order(ranges: &[(usize, usize)]) {
     let _all = Asking::hold_all();
     let mut ahead = {
         let mut j = journal_mut();
@@ -687,18 +722,11 @@ fn ask_rest(ranges: &[(usize, usize)]) {
     // askings a frame with the switch on, as without it). They are asked
     // here, once; what is not write-watched stays with `writes`.
     let mut written = Vec::new();
-    for &(start, end) in ranges {
-        if start >= end || published(start, end) {
-            continue;
-        }
-        let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !ahead.covers(first, last)
-            && let Some(pages) = kernel_written(first, last)
-        {
-            written.extend(pages);
-            ahead.insert_uncovered(first, last);
-        }
-    }
+    ahead.ask_uncovered(ranges, |first, last| {
+        let Some(pages) = kernel_written(first, last) else { return false };
+        written.extend(pages);
+        true
+    });
     note_hot(&written);
     let mut j = journal_mut();
     // A number of its own, and the one this asking stands under: between
@@ -3444,6 +3472,35 @@ mod parts_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rest_asks_a_containing_range_first_and_retries_inside_a_refused_range() {
+        // Windows asks about whole pages. The first range starts earlier
+        // in its page, but the second one's page interval contains it.
+        let inputs = [
+            (8 * PAGE + 1, 9 * PAGE), (8 * PAGE + 7, 11 * PAGE),
+            (7 * PAGE, 7 * PAGE), (2 * PAGE, 6 * PAGE),
+            (3 * PAGE, 4 * PAGE), (2 * PAGE, 6 * PAGE),
+            (10 * PAGE, 12 * PAGE), (3 * PAGE, 4 * PAGE),
+        ];
+        for indexed in [false, true] {
+            let mut calls = Vec::new();
+            let mut ahead = AskedRanges::new(Vec::new(), indexed);
+            with_rest_order(&inputs, indexed, |ranges| {
+                ahead.ask_uncovered(ranges, |first, last| {
+                    calls.push((first, last));
+                    (first, last) != (2, 6)
+                });
+            });
+            assert_eq!(calls, if indexed {
+                vec![(2, 6), (2, 6), (3, 4), (8, 11), (10, 12)]
+            } else {
+                vec![(8, 9), (8, 11), (2, 6), (3, 4), (2, 6), (10, 12)]
+            });
+            assert!(ahead.covers(3, 4) && ahead.covers(10, 12) && ahead.covers(8, 11));
+            assert!(!ahead.covers(2, 6) && !ahead.covers(8, 12));
+        }
+    }
+
     #[test]
     fn indexed_askings_cover_exactly_what_one_asking_covered() {
         // include duplicates, containment, adjacency and pairs that overlap

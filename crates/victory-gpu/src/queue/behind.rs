@@ -138,6 +138,17 @@ struct State<W> {
 }
 
 impl<W> State<W> {
+    fn next_part(&self, queue: usize, limit: u64, adjacent: bool) -> Option<usize> {
+        let follows = |e: &Entry<W>| e.queue == queue && e.number < limit;
+        // A different queue's entry, including a present, stays between
+        // two adjacent parts even if more work of this queue is ready.
+        if adjacent {
+            self.items.front().is_some_and(follows).then_some(0)
+        } else {
+            self.items.iter().position(follows)
+        }
+    }
+
     fn floor(&self, queue: usize) -> u64 {
         self.floors.iter().find(|f| f.0 == queue).map_or(0, |f| f.1)
     }
@@ -388,7 +399,7 @@ impl<W: Work> Lane<W> {
         while runs > 0 && !forced {
             let next = {
                 let mut state = self.lock();
-                let at = state.items.iter().position(|e| e.queue == entry.queue && e.number < limit);
+                let at = state.next_part(entry.queue, limit, crate::host::join_reads());
                 at.and_then(|at| Some((at, state.items.remove(at)?)))
             };
             let Some((at, next)) = next else {
@@ -569,6 +580,9 @@ impl Work for Job {
         match &next {
             Job::Value(_, wait) => {
                 let met = wait.met();
+                if !met && crate::host::join_reads() {
+                    return Err(next);
+                }
                 let ahead = !met && crate::host::late_met_known(wait) == Some(true);
                 if !met && !ahead && !hosts().any(|list| crate::host::will_meet(list, wait)) {
                     return Err(next);
@@ -584,6 +598,7 @@ impl Work for Job {
                     return Err(next);
                 }
             }
+            Job::Signal(..) if crate::host::join_reads() => return Err(next),
             Job::Signal(..) => {}
             Job::Run(_, more, order) => {
                 let runs: Vec<&crate::host::HostList> = order.iter().map(|&i| more[i].host()).collect();
@@ -972,6 +987,20 @@ mod tests {
     use std::sync::Arc;
 
     type Log = Arc<Mutex<Vec<String>>>;
+
+    #[test]
+    fn adjacent_parts_stop_at_another_queue_and_at_the_limit() {
+        let log = Log::default();
+        let lane = Lane::new();
+        lane.push(2, [T::Present("show", log.clone())]);
+        lane.push(1, [T::Run("later", log)]);
+        let state = lane.lock();
+        let limit = state.items[1].number + 1;
+        assert_eq!(state.next_part(1, limit, true), None);
+        assert_eq!(state.next_part(1, limit, false), Some(1));
+        assert_eq!(state.next_part(2, state.items[0].number, true), None);
+        assert_eq!(state.next_part(2, limit, true), Some(0));
+    }
 
     /// A job of a test: what it stands at, and what it does.
     enum T {

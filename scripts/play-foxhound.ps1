@@ -127,9 +127,12 @@ if ($Ryzen3700X) {
     $settings.VICTORY_UPLOAD_POOL_MB = '96'
     $settings.VICTORY_SECTION_MB = '2'
     $settings.VICTORY_WATCH_INDEX = '1'
-    # Keep recording on the game's threads for the prison geometry.
+    # The title records its own geometry. A separate submission thread can
+    # prepare adjacent read-only parts without moving a title write or fence.
     $settings.Remove('VICTORY_THIN')
-    $settings.Remove('VICTORY_JOIN_PARTS')
+    $settings.VICTORY_ASYNC_SUBMIT = '1'
+    $settings.VICTORY_JOIN_READS = '1'
+    $settings.VICTORY_SUBMIT_UPLOAD_BATCH = '1'
 }
 if (-not $SeriesS) {
     if ($Res -eq '1440') { $settings.VICTORY_NATIVE_1440P = '1' }

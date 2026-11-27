@@ -2456,6 +2456,8 @@ impl Step {
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
+    /// Asked only after the list was detached. Reset replaces the whole recording.
+    join_reads: OnceLock<JoinReads>,
     uploads: Vec<ID3D12Resource>,
     /// Copy sources from [`HostList::upload`]'s pool: the buffer, its size
     /// class, whether it is a shared buffer. Given back to the pool when the
@@ -3337,6 +3339,62 @@ pub(crate) fn joins() -> (usize, usize) {
     if ahead_of_writes() { joins_asked() } else { (1, 1) }
 }
 
+/// Join read-only preparation across parts on the submission thread. No title,
+/// upload or card bytes are copied by the check, only the CPU's step descriptions.
+pub(crate) fn join_reads() -> bool {
+    crate::asked_for!("VICTORY_JOIN_READS")
+}
+
+/// What merging the preparation of a closed list can move across a part boundary.
+#[derive(Clone, Copy, Default)]
+struct JoinReads {
+    changes_title: bool,
+    lands: bool,
+    host_work: bool,
+    prefetches: bool,
+    shared_fill: bool,
+}
+
+impl JoinReads {
+    fn of(d: &Deferred) -> Self {
+        let mut result = Self {
+            lands: !d.writes.is_empty() || !d.backs.is_empty() || !d.texture_backs.is_empty(),
+            prefetches: !d.prelude_uploads.is_empty(),
+            ..Self::default()
+        };
+        for step in &d.copies {
+            match step {
+                // A placed command may also write title memory on the CPU, and another
+                // address may show those bytes. Do not move a refresh across it.
+                Step::Copy(..) | Step::Placed(_) | Step::Run(_) => result.changes_title = true,
+                Step::GpuWrite(..) => result.lands = true,
+                Step::Host(..) => result.host_work = true,
+                Step::Refresh(..) | Step::RefreshSet(_) | Step::Texture(_) => result.prefetches = true,
+                Step::Fill(_, _, _, Some(card_steps::FillTo::Slot(..))) => result.shared_fill = true,
+                Step::Fill(..) | Step::Plane(..) => {}
+            }
+        }
+        result
+    }
+
+    fn include(&mut self, other: Self) {
+        self.changes_title |= other.changes_title;
+        self.lands |= other.lands;
+        self.host_work |= other.host_work;
+        self.prefetches |= other.prefetches;
+        self.shared_fill |= other.shared_fill;
+    }
+
+    fn followed_by(self, next: Self) -> bool {
+        // A write visible to the title must land at the original boundary. Host
+        // callbacks may change shadow or texture state. A preceding callback can
+        // stay in place when there is nothing to prefetch to its front and the
+        // following part only reads into its own memory.
+        !self.changes_title && !self.lands && !next.changes_title && !next.host_work && !next.shared_fill
+            && !(self.host_work && (self.prefetches || next.prefetches || next.lands))
+    }
+}
+
 fn joins_asked() -> (usize, usize) {
     static MOST: OnceLock<(usize, usize)> = OnceLock::new();
     let of = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<usize>().ok());
@@ -3354,6 +3412,29 @@ fn joins_asked() -> (usize, usize) {
 /// changes no title memory that they read ([`Step::Copy`], [`Step::Run`]).
 pub(crate) fn joinable<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&HostList]) -> bool {
     let _walk = lean::walking(lean::Walk::Joinable);
+    if join_reads() {
+        if crate::picked::on() {
+            // The actual ranges are decided after preparation.
+            return false;
+        }
+        let description = |list: &HostList| {
+            let d = list.deferred();
+            *d.join_reads.get_or_init(|| JoinReads::of(&d))
+        };
+        let mut before = JoinReads::default();
+        for list in ahead {
+            // A repeat has the same private upload and plane destinations.
+            if next.iter().any(|&other| std::ptr::eq(list, other)) {
+                return false;
+            }
+            before.include(description(list));
+        }
+        let mut after = JoinReads::default();
+        for &list in next {
+            after.include(description(list));
+        }
+        return before.followed_by(after);
+    }
     if next.iter().any(|l| l.deferred().copies.iter().any(|s| matches!(s, Step::Copy(..) | Step::Run(_)))) {
         return false;
     }
@@ -5875,7 +5956,10 @@ impl Host {
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
         // Or the reads are done on the card, behind the flights.
-        let own = if late { self.card_steps(runs) } else { None };
+        // A card-step prelude executes before every list, and may replace a
+        // descriptor slot. Keep it within its original part under the read-only
+        // join policy. If there is a real dependency the normal flight wait runs.
+        let own = if late && (parts.is_empty() || !join_reads()) { self.card_steps(runs) } else { None };
         ahead.part(12);
         stage.next("submit: waiting for flights it reads from");
         let mut waited_for_flights = false;
@@ -6012,7 +6096,8 @@ impl Host {
         // What flights in the air may write.
         let air = line().written.clone();
         stage.next("submit: refreshes ahead of writes");
-        if refresh_front() {
+        let front = refresh_front(!parts.is_empty());
+        if front {
             batch.refresh_front(runs, &parts);
         } else if ahead_of_writes() {
             batch.refresh_ahead(runs, |list, i| own.as_ref().is_some_and(|own| own.takes(list, i)));
@@ -6039,7 +6124,7 @@ impl Host {
         // added, the next submission's refresh of these pages moves here.
         // Without refreshes in front the flush above did it already.
         let landed = crate::memory::landed();
-        if refresh_front() {
+        if front {
             for (shadow, from, to) in landed {
                 if crate::watch::light() && lean::polled(lean::Poll::Landed, &shadow, from, to - from) {
                     continue;
@@ -8503,9 +8588,13 @@ fn ahead_of_writes() -> bool {
 /// earlier than its step: the title's bytes are the same until a step writes
 /// title memory, and behind such a step everything is asked for again, as it
 /// was.
-fn refresh_front() -> bool {
+fn refresh_front(joined: bool) -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    ahead_of_writes() && (joins_asked().0 > 1 || *ON.get_or_init(|| crate::switch::on("VICTORY_REFRESH_FRONT")))
+    ahead_of_writes() && front_for_parts(join_reads(), joins_asked().0 > 1, joined, *ON.get_or_init(|| crate::switch::on("VICTORY_REFRESH_FRONT")))
+}
+
+fn front_for_parts(reads: bool, enabled: bool, joined: bool, requested: bool) -> bool {
+    requested || (enabled && (!reads || joined))
 }
 
 /// Per copy what is refreshed in front of a submission's steps, as
@@ -8595,6 +8684,36 @@ fn written_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize
     spans.into_iter().filter(|(_, s)| s.2).map(|(copy, (from, to, _))| (copy, from, to)).collect()
 }
 
+/// The refresh range up to a copy's first shader write, with the copy itself.
+/// Only CPU metadata is kept. No title, upload or card bytes move here.
+struct AheadSpans<T>(ByCopy<(T, usize, usize, bool)>);
+
+impl<T> Default for AheadSpans<T> {
+    fn default() -> Self {
+        Self(ByCopy::default())
+    }
+}
+
+impl<T> AheadSpans<T> {
+    fn refresh(&mut self, key: usize, from: usize, to: usize, hold: impl FnOnce() -> T) {
+        let span = self.0.entry(key).or_insert_with(|| (hold(), from, to, false));
+        if !span.3 {
+            span.1 = span.1.min(from);
+            span.2 = span.2.max(to);
+        }
+    }
+
+    fn write(&mut self, key: usize) {
+        if let Some(span) = self.0.get_mut(&key) {
+            span.3 = true;
+        }
+    }
+
+    fn due(self) -> Vec<(T, usize, usize)> {
+        self.0.into_values().filter_map(|(copy, from, to, written)| written.then_some((copy, from, to))).collect()
+    }
+}
+
 #[cfg(test)]
 mod keep_tests {
     use super::{ByCopy, keep_outside};
@@ -8639,6 +8758,51 @@ mod keep_tests {
 #[cfg(test)]
 mod written_spans_tests {
     use super::{Touch, front_spans, split, written_spans};
+
+    #[test]
+    fn read_groups_keep_public_writes_and_shared_upload_slots_at_their_boundary() {
+        use super::{Deferred, JoinReads, Step, card_steps::FillTo};
+        let reads = JoinReads::of(&Deferred::default());
+        let mut d = Deferred::default();
+        d.copies.push(Step::Fill(128, 256, 4, None));
+        let private_fill = JoinReads::of(&d);
+        assert!(reads.followed_by(private_fill));
+        d.copies.push(Step::Fill(132, 260, 4, Some(FillTo::Slot(32, 1))));
+        assert!(!reads.followed_by(JoinReads::of(&d)));
+        d.copies.clear();
+        d.copies.push(Step::Host(Box::new(|| ()), (0, 0)));
+        assert!(JoinReads::of(&d).followed_by(private_fill));
+        assert!(!reads.followed_by(JoinReads::of(&d)));
+        d.copies.clear();
+        d.writes.push((256, crate::queue::Written::Value(1), 4));
+        assert!(!JoinReads::of(&d).followed_by(private_fill));
+        d.writes.clear();
+        d.copies.push(Step::Copy(2048, 1024, 4));
+        assert!(!reads.followed_by(JoinReads::of(&d)));
+        assert!(!JoinReads::of(&d).followed_by(private_fill));
+    }
+
+    #[test]
+    fn only_actual_read_groups_need_the_front_refresh() {
+        use super::front_for_parts;
+        assert!(!front_for_parts(true, true, false, false));
+        assert!(front_for_parts(true, true, true, false));
+        assert!(front_for_parts(false, true, false, false));
+        assert!(front_for_parts(true, false, false, true));
+    }
+
+    #[test]
+    fn streaming_refreshes_keep_the_first_write_boundary_and_copy_identity() {
+        use super::AheadSpans;
+        let mut spans = AheadSpans::default();
+        spans.refresh(1, 15, 20, || "first");
+        spans.refresh(1, 8, 30, || panic!("copy already held"));
+        spans.write(1);
+        spans.refresh(1, 0, 100, || panic!("copy already held"));
+        spans.write(2);
+        spans.refresh(2, 9, 18, || "unwritten since refresh");
+        assert_eq!(spans.due(), [("first", 8, 30)]);
+    }
 
     #[test]
     fn everything_is_refreshed_in_front_but_what_a_part_gave_its_shaders() {
@@ -9117,9 +9281,56 @@ impl Batch {
     /// Before the steps of `runs` ([`ahead_of_writes`]); copies and fills
     /// that `taken` names are not done on the CPU.
     fn refresh_ahead(&mut self, runs: &[&HostList], taken: impl Fn(&HostList, usize) -> bool) {
+        let due = if join_reads() {
+            let _walk = lean::walking(lean::Walk::RefreshAhead);
+            let mut spans = AheadSpans::default();
+            let mut once = sets::Once::default();
+            'steps: for &list in runs {
+                for (i, step) in list.deferred().copies.iter().enumerate() {
+                    match step {
+                        Step::Refresh(..) | Step::RefreshSet(_) => {
+                            for (shadow, at, len) in sets::refreshes(step, &mut once) {
+                                spans.refresh(std::sync::Arc::as_ptr(shadow) as usize, at, at + len, || shadow.clone());
+                            }
+                        }
+                        Step::GpuWrite(shadow, ..) => spans.write(std::sync::Arc::as_ptr(shadow) as usize),
+                        Step::Copy(..) if taken(list, i) => {}
+                        Step::Copy(..) | Step::Run(_) | Step::Placed(_) => break 'steps,
+                        _ => {}
+                    }
+                }
+            }
+            spans.due()
+        } else {
+            Self::ahead_from_touches(runs, taken)
+        };
+        for (shadow, from, to) in &due {
+            self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, (*from, *to));
+        }
+        let started = std::time::Instant::now();
+        let before = PREPARING[0].load(Ordering::Relaxed);
+        let small = due.len() <= 256;
+        lean::spread(due.len(), small, move |i| {
+            let (shadow, from, to) = &due[i];
+            if !lean::polled(lean::Poll::Ahead, shadow, *from, *to - *from) {
+                Self::update(shadow, *from, *to);
+            }
+        });
+        // The time counted is the time it took, not the threads' sum.
+        let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
+        PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
+        let ns = started.elapsed().as_nanos() as u64;
+        SPLIT[6].fetch_add(ns, Ordering::Relaxed);
+        SPLIT[9].fetch_add(ns, Ordering::Relaxed);
+    }
+
+    fn ahead_from_touches(
+        runs: &[&HostList],
+        taken: impl Fn(&HostList, usize) -> bool,
+    ) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
         let mut copies: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = ByCopy::default();
         let mut touches = Vec::new();
-        let due: Vec<_> = {
+        {
             let _walk = lean::walking(lean::Walk::RefreshAhead);
             // A set that comes again adds no touch.
             let mut once = sets::Once::default();
@@ -9144,25 +9355,7 @@ impl Batch {
                 .into_iter()
                 .filter_map(|(key, from, to)| Some((copies.get(&key)?.clone(), from, to)))
                 .collect()
-        };
-        for (shadow, from, to) in &due {
-            self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, (*from, *to));
         }
-        let started = std::time::Instant::now();
-        let before = PREPARING[0].load(Ordering::Relaxed);
-        let small = due.len() <= 256;
-        lean::spread(due.len(), small, move |i| {
-            let (shadow, from, to) = &due[i];
-            if !lean::polled(lean::Poll::Ahead, shadow, *from, *to - *from) {
-                Self::update(shadow, *from, *to);
-            }
-        });
-        // The time counted is the time it took, not the threads' sum.
-        let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
-        PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
-        let ns = started.elapsed().as_nanos() as u64;
-        SPLIT[6].fetch_add(ns, Ordering::Relaxed);
-        SPLIT[9].fetch_add(ns, Ordering::Relaxed);
     }
 
     /// The fills noted are done.
