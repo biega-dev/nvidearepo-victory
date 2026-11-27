@@ -35,8 +35,8 @@ Install [Rust](https://rustup.rs) and the
 with "Desktop development with C++", then in PowerShell:
 
 ```powershell
-git clone https://github.com/trustno1-coder/VIctory-NVIDIA
-cd VIctory-NVIDIA
+git clone https://github.com/biega-dev/nvidearepo-victory
+cd nvidearepo-victory
 .\Get-NVIDIA-DLSS.cmd
 powershell -ExecutionPolicy Bypass -File scripts\play-nvidia.ps1 -Exe 'D:\Games\MyDump\game_scarlett_master.exe'
 ```
@@ -265,6 +265,8 @@ fork has always had; its options:
 | `-Dlss off` / `dlaa` / `balanced` / `performance` | the title's own upscaling, or another DLSS mode |
 | `-Fps 60` | a frame rate cap (30 is the title's own) |
 | `-SeriesS` | the Series S profile: 1280x720 inside, faster, softer |
+| `-Ryzen3700X` | the original eight-core submission and streaming profile |
+| `-RyzenPreparo` | opt in to the revised Ryzen 3700X profile with batched uploads, command-list reuse and texture scheduling for the 8 GB RTX 3070 |
 | `-Res 1080to1440` / `4k` | scene at 1080p upscaled by the title / the stock 3840x2160 output |
 | `-Res wide` | Series X at 5120x1440 (32:9): the title's own camera, culling and motion vectors made for the wide picture, the interface kept 16:9 in the middle; another wide size: `-Res 1440 -More @{VICTORY_DISPLAY_WIDE='3440x1440'}` |
 | `-NoFrameGenReady` | frame generation only with `-FrameGen` (it is otherwise made ready at every start, so the menu can switch it) |

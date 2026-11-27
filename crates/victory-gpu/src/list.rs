@@ -759,10 +759,13 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         list.gate.clear();
     }
     #[cfg(windows)]
-    with_state(this, |host, state| {
-        host.reset();
-        state.reset(pipeline);
-    });
+    if let Some(host) = host_list_held(this) {
+        host.title_reset_call();
+        with_state_on(Some(host), this, |host, state| {
+            host.reset();
+            state.reset(pipeline);
+        });
+    }
     crate::pipeline::bound(pipeline);
     #[cfg(not(windows))]
     let _ = this;
@@ -1978,6 +1981,7 @@ extern "system" fn execute_indirect(
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
         with_state_on(host_list_held(this), this, |list, s| {
+            list.indirect_on_replacement();
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
     } else {
@@ -2454,6 +2458,83 @@ static NEWER_THIN_FUNCTIONS: Table<160> = Table(thin::table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[cfg(windows)]
+    #[test]
+    fn title_reset_reuses_only_an_untouched_replacement_list() {
+        // The host and its switches are process-wide. Exercise the actual
+        // title entry with the preset enabled, independently of other tests.
+        if std::env::var_os("VICTORY_TEST_RESET_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "list::tests::title_reset_reuses_only_an_untouched_replacement_list", "--nocapture"])
+                .env("VICTORY_TEST_RESET_CHILD", "1")
+                .env("VICTORY_FRESH_OPEN", "1")
+                .env("VICTORY_RESET_EMPTY", "1")
+                .env("VICTORY_THIN", "0")
+                .env("VICTORY_CUT_WRITES", "0")
+                .env_remove("VICTORY_AB")
+                .status().unwrap();
+            assert!(status.success(), "isolated reset test exited with {status}");
+            return;
+        }
+        if crate::host::host().is_none() {
+            eprintln!("SKIPPED title_reset_reuses_only_an_untouched_replacement_list: no D3D12 device");
+            return;
+        }
+        let null = std::ptr::null();
+        let (mut allocator, mut list) = (null, null);
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
+        assert_eq!(close(list), S_OK);
+        let _submitted = detach(&[list]);
+        let reset = slot::<extern "system" fn(This, This, This) -> HRESULT>(list, 0x50);
+        let calls = || host_list_held(list).unwrap().title_calls();
+        let before = calls();
+        let reused = crate::host::reused_open_lists();
+        assert_eq!(reset(list, null, null), E_INVALIDARG);
+        assert_eq!(reset(list, allocator, null), S_OK);
+        assert_eq!(crate::host::reused_open_lists(), reused + 1, "the reset itself invalidated the empty recording");
+        assert_eq!(calls(), before);
+
+        host_list_held(list).unwrap().leave_open();
+        let mut value = 0u32;
+        write32(list, std::ptr::from_mut(&mut value) as u64, 9, 0, 0);
+        let dirty = calls();
+        assert_eq!(reset(list, allocator, null), S_OK);
+        assert_eq!(calls(), dirty + 1, "a real recorded command must use the ordinary reset");
+        assert!(host_list_held(list).unwrap().untouched());
+
+        host_list_held(list).unwrap().leave_open();
+        host_list_held(list).unwrap().hold_indirect();
+        let pending = calls();
+        assert_eq!(reset(list, allocator, null), S_OK);
+        assert_eq!(calls(), pending + 1, "a held indirect must use the ordinary reset");
+
+        // A real indirect dispatch takes the uncounted list lookup even
+        // when the missing pipeline ultimately prevents it from drawing.
+        // Without its marker this recording would pass both empty checks.
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_COMMAND_SIGNATURE_DESC, D3D12_INDIRECT_ARGUMENT_DESC, D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+        };
+        let arg = D3D12_INDIRECT_ARGUMENT_DESC { Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH, ..Default::default() };
+        let desc = D3D12_COMMAND_SIGNATURE_DESC { ByteStride: 12, NumArgumentDescs: 1, pArgumentDescs: &arg, NodeMask: 0 };
+        let mut signature = null;
+        assert_eq!(crate::signature::create(null, std::ptr::from_ref(&desc).cast(), null, &PAGEABLE_IIDS[0], &mut signature), S_OK);
+        let arguments = crate::resource::test_buffer(12);
+        host_list_held(list).unwrap().leave_open();
+        execute_indirect(list, signature, 1, arguments, 0, null, 0);
+        assert_eq!(reset(list, allocator, null), S_OK);
+        assert_eq!(crate::host::reused_open_lists(), reused + 1, "an indirect call must invalidate the open marker");
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(arguments), 0);
+        assert_eq!(release(signature), 0);
+        host_list_held(list).unwrap().leave_open();
+        host_list_held(list).unwrap().changed_something();
+        assert_eq!(reset(list, allocator, null), S_OK);
+        assert_eq!(crate::host::reused_open_lists(), reused + 1, "dirty recordings must be reset");
+        assert_eq!(list_release(list), 0);
+        assert_eq!(allocator_release(allocator), 0);
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {

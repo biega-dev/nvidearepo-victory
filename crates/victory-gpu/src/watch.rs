@@ -31,6 +31,9 @@ use std::ops::{Bound, RangeBounds};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, RwLock};
 
+mod epochs;
+use epochs::Epochs;
+
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
 /// big buffers cost more than the copies they saved.
@@ -59,7 +62,7 @@ impl Journal {
     /// Page `page` was found written by asking `now`: the parts in `parts`
     /// (a bit each). The asking that found it written before (0: none).
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
-        let before = self.written.insert(page, now).unwrap_or(0);
+        let before = self.written.record(page, now);
         if parts == WHOLE || !parts_on() {
             self.parts.remove(&page);
             return before;
@@ -207,7 +210,7 @@ impl AskedRanges {
 
 struct Journal {
     /// Page number → the asking that last found it written.
-    written: BTreeMap<usize, u64>,
+    written: Epochs,
     /// The same for each of a page's sixteen parts ([`KERNEL_PAGE`]), where
     /// the parts are known ([`parts_on`]); a page that is not here was
     /// written whole, as far as anyone knows.
@@ -229,13 +232,16 @@ struct Journal {
 /// one lock for all of it those threads ran one at a time: 22 of 96 looks at
 /// the submitting thread, and one in six of those at the six threads beside
 /// it, found it waiting for that lock (run pooloff1).
-static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
-    written: BTreeMap::new(),
+static JOURNAL: std::sync::LazyLock<RwLock<Journal>> = std::sync::LazyLock::new(|| RwLock::new(Journal {
+    // VICTORY_WATCH_BLOCKS=1 keeps last-write numbers together for 64
+    // adjacent pages. A refresh in the prison asked about some 5,500 ranges
+    // a frame. The same lock and the same guard/asking decide what is known.
+    written: Epochs::new(crate::switch::on("VICTORY_WATCH_BLOCKS")),
     parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
     ahead: AskedRanges::EMPTY,
     ahead_asked: 0,
     kept: false,
-});
+}));
 
 fn journal() -> std::sync::RwLockReadGuard<'static, Journal> {
     if let Ok(j) = JOURNAL.try_read() {
@@ -689,7 +695,7 @@ pub(crate) fn ask_line(frames: f64) {
 /// [`ask_once`] after its [`ask_ahead`]: what that left to `writes`, and the
 /// asking stands.
 fn ask_rest(ranges: &[(usize, usize)]) {
-    with_rest_order(ranges, watch_index(), ask_rest_in_order);
+    with_rest_order(ranges, watch_index() && crate::asked_for!("VICTORY_WATCH_BLOCKS"), ask_rest_in_order);
 }
 
 /// Order the queries before taking ASKING. Keep each original range: two
@@ -837,7 +843,7 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
     let j = journal();
     j.ahead
         .covers(first, last)
-        .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
+        .then(|| (j.ahead_asked, j.written.records(first, last)))
 }
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -853,7 +859,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         materialize(start, end.saturating_sub(start));
     }
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let of = |j: &Journal| -> Vec<(usize, u64)> { j.written.range(first..last).map(|(&p, &w)| (p, w)).collect() };
+    let of = |j: &Journal| j.written.records(first, last);
     // Asked ahead with the submission's other ranges: the journal has it.
     let ahead = |j: &Journal| j.ahead.covers(first, last).then(|| (j.ahead_asked, of(j)));
     if let Some(known) = ahead(&journal()) {
@@ -945,8 +951,7 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
         return false;
     };
-    (ranged != 0 || taken.iter().all(|&at| at != 0))
-        && j.written.range(first..last).all(|(&page, &write)| write <= taken[page - first].max(ranged))
+    j.written.unchanged(first, taken, ranged)
 }
 
 impl Tracked {
@@ -3445,7 +3450,7 @@ mod parts_tests {
     #[test]
     fn the_parts_of_a_page_written_since_it_was_taken() {
         let mut j = Journal {
-            written: BTreeMap::new(),
+            written: Epochs::new(false),
             parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
             ahead: AskedRanges::EMPTY,
             ahead_asked: 0,
@@ -3961,7 +3966,8 @@ mod tests {
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE) as *mut u8).write_volatile(1) };
         ask_rest(&ranges);
-        let last = journal().written.get(&(p / PAGE + 1)).copied();
+        let page = p / PAGE + 1;
+        let last = journal().written.records(page, page + 1).first().map(|&(_, epoch)| epoch);
         ask_once_end();
         assert!(last.is_some_and(|last| last > copied), "{last:?} is not after {copied}");
         // SAFETY: our allocation.

@@ -1931,7 +1931,33 @@ pub(crate) fn targets_room_kept() -> u64 {
     let (last, since) = targets_seen(last, since, targets, now);
     GREW[0].store(last, Relaxed);
     GREW[1].store(since, Relaxed);
-    targets_kept(most, targets, now.saturating_sub(since), settle)
+    let flat = targets_kept(most, targets, now.saturating_sub(since), settle);
+    // NVIDIA #76: leave textures more of the local DXGI budget in scenes
+    // whose render targets stay small. Either manual reserve setting takes
+    // precedence. This is a CPU-side admission estimate; no bytes are moved.
+    static ADAPTIVE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ADAPTIVE.get_or_init(|| {
+        std::env::var_os("VICTORY_TARGETS_PEAK_ROOM").is_some_and(|v| v == "1")
+            && std::env::var_os("VICTORY_CARD_ROOM_FOR_TARGETS_MB").is_none()
+            && std::env::var_os("VICTORY_CARD_ROOM_FOR_TARGETS_SETTLE_MS").is_none()
+    }) {
+        return flat;
+    }
+    static PEAK: AtomicU64 = AtomicU64::new(0);
+    let mut peak = PEAK.load(Relaxed);
+    if targets > peak {
+        peak = PEAK.fetch_max(targets, Relaxed).max(targets);
+    }
+    target_room_from_peak(flat, targets, peak)
+}
+
+/// Allow half the observed peak for further growth. At startup a scene on
+/// the 3070 grew from 410 to 967 MiB between samples. Keep at least 640 MiB
+/// spare for such a jump, within the existing reserve and settling rules.
+#[cfg(any(windows, test))]
+fn target_room_from_peak(flat: u64, targets: u64, peak: u64) -> u64 {
+    const MIN_SPARE: u64 = 640 << 20;
+    peak.saturating_add((peak / 2).max(MIN_SPARE)).saturating_sub(targets).min(flat)
 }
 
 /// [`targets_room_kept`]'s record of the targets' bytes (`last`) and of
@@ -4893,6 +4919,22 @@ float4 lit() : SV_Target { return 1.0; }
         let (last, since) = targets_seen(2400 * MIB, 1_000, 1000 * MIB, 9_000);
         assert_eq!((last, since), (1000 * MIB, 1_000));
         assert_eq!(targets_seen(last, since, 2400 * MIB, 30_000), (2400 * MIB, 30_000));
+    }
+
+    #[test]
+    fn peak_target_room_covers_initial_growth_and_respects_the_existing_limit() {
+        const MIB: u64 = 1 << 20;
+        let room = |flat, targets, peak| target_room_from_peak(flat * MIB, targets * MIB, peak * MIB) / MIB;
+        // The first allocation and a scene that has held only a few targets.
+        assert_eq!(room(3072, 0, 0), 640);
+        assert_eq!(room(2662, 410, 410), 640);
+        // The ordinary spare grows with the peak. Returning targets leaves
+        // their space available when the scene asks for them again.
+        assert_eq!(room(1736, 1336, 1336), 668);
+        assert_eq!(room(2000, 1072, 1336), 932);
+        // A large scene reaches the cap, then gives it back once settled.
+        assert_eq!(room(172, 2900, 2900), 172);
+        assert_eq!(room(0, 2900, 2900), 0);
     }
 
     /// A placed texture viewed from a later level has a host copy of that

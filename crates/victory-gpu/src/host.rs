@@ -1313,10 +1313,21 @@ fn fresh_open() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_FRESH_OPEN").is_none_or(|v| v != "0"))
 }
 
+/// The Ryzen preset lets the title's reset reuse an untouched replacement
+/// recording. No title, upload or card bytes move in this check.
+fn reset_empty() -> bool {
+    crate::asked_for!("VICTORY_RESET_EMPTY")
+}
+
 /// Since the last frame line: host lists left open ([`fresh_open`]), the
 /// title's resets that found one so and did nothing to it, and those closed
 /// after all (submitted again without a reset, or recorded into before it).
 static FRESH_OPEN: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+#[cfg(test)]
+pub(crate) fn reused_open_lists() -> u64 {
+    FRESH_OPEN[1].load(Ordering::Relaxed)
+}
 
 /// [`FRESH_OPEN`], for the frame-rate line.
 fn fresh_open_line(frames: f64) {
@@ -6863,6 +6874,31 @@ impl HostList {
         }
     }
 
+    /// A title reset is not a recorded command. Count and flush it as before
+    /// unless the list is exactly the empty replacement left at submission.
+    pub(crate) fn title_reset_call(&self) {
+        if reset_empty() && !self.holding.load(Ordering::Relaxed) {
+            let calls = self.left_open[0].load(Ordering::Acquire);
+            if calls != 0 && self.open_marks_match(calls, self.left_open[1].load(Ordering::Relaxed)) {
+                return;
+            }
+        }
+        self.title_call();
+    }
+
+    /// Indirect execution bypasses the ordinary title-call counter so adjacent
+    /// indirects can merge. If it touches a replacement before reset, the
+    /// marker must no longer identify an empty host command list.
+    pub(crate) fn indirect_on_replacement(&self) {
+        if self.left_open[0].load(Ordering::Relaxed) != 0 {
+            self.left_open[1].store(0, Ordering::Relaxed);
+        }
+    }
+
+    fn open_marks_match(&self, calls: u64, epoch: u64) -> bool {
+        calls == self.title_calls() + 1 && epoch == self.epoch() + 1
+    }
+
     /// Whether the list is as [`HostList::leave_open`] left it: nothing was
     /// recorded into it since, as far as its title calls and its epoch say.
     /// It is no longer marked so; one left open that something was recorded
@@ -6873,7 +6909,7 @@ impl HostList {
         if calls == 0 {
             return false;
         }
-        if calls == self.title_calls() + 1 && epoch == self.epoch() + 1 {
+        if self.open_marks_match(calls, epoch) {
             return true;
         }
         FRESH_OPEN[2].fetch_add(1, Ordering::Relaxed);

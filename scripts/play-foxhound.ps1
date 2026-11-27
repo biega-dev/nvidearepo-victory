@@ -42,8 +42,11 @@ param(
     [switch]$Fast,
     # Reserve CPU time for submission on the eight-core Ryzen test system.
     [switch]$Ryzen3700X,
+    # Use the Ryzen profile with the new command-list, upload and texture-budget paths.
+    [switch]$RyzenPreparo,
     [hashtable]$More = @{}
 )
+if ($RyzenPreparo) { $Ryzen3700X = $true }
 $repo = Split-Path $PSScriptRoot -Parent
 # What the F1 menu saved: its own choices (VICTORY_MENU_...) stand in for this script's options, and its
 # switches go over the settings below. An empty value unsets a switch.
@@ -127,12 +130,20 @@ if ($Ryzen3700X) {
     $settings.VICTORY_UPLOAD_POOL_MB = '96'
     $settings.VICTORY_SECTION_MB = '2'
     $settings.VICTORY_WATCH_INDEX = '1'
-    # The title records its own geometry. A separate submission thread can
-    # prepare adjacent read-only parts without moving a title write or fence.
     $settings.Remove('VICTORY_THIN')
+    $settings.Remove('VICTORY_JOIN_PARTS')
+}
+if ($RyzenPreparo) {
+    # Keep geometry recording on title threads, and prepare adjacent read-only
+    # parts together only when doing so preserves their command order.
+    $settings.VICTORY_JOIN_PARTS = '8'
     $settings.VICTORY_ASYNC_SUBMIT = '1'
     $settings.VICTORY_JOIN_READS = '1'
     $settings.VICTORY_SUBMIT_UPLOAD_BATCH = '1'
+    $settings.VICTORY_RESET_EMPTY = '1'
+    $settings.VICTORY_WATCH_BLOCKS = '1'
+    $settings.VICTORY_TARGETS_PEAK_ROOM = '1'
+    $settings.VICTORY_TEXTURE_QUEUE_DENSE = '1'
 }
 if (-not $SeriesS) {
     if ($Res -eq '1440') { $settings.VICTORY_NATIVE_1440P = '1' }
@@ -172,7 +183,7 @@ $settings.VICTORY_MENU_FRAMEGEN = if ($settings.VICTORY_FRAMEGEN -eq '1') { [str
 $settings.VICTORY_MENU_FPS = [string]$fpsWanted
 $settings.VICTORY_MENU_FILE = $menuFile
 $settings.VICTORY_MENU_PLAY = $MyInvocation.MyCommand.Path
-$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($NoFrameGenReady) { ' -NoFrameGenReady' })$(if ($Fast) { ' -Fast' })$(if ($Ryzen3700X) { ' -Ryzen3700X' })"
+$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($NoFrameGenReady) { ' -NoFrameGenReady' })$(if ($Fast) { ' -Fast' })$(if ($RyzenPreparo) { ' -RyzenPreparo' } elseif ($Ryzen3700X) { ' -Ryzen3700X' })"
 
 $victory = Join-Path $repo "target\$Build\victory.exe"
 if (-not (Test-Path $victory)) {

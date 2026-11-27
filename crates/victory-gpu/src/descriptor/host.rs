@@ -1053,6 +1053,10 @@ pub(crate) fn tabled_reread() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TABLED_REREAD").is_some_and(|v| v == "1"))
 }
 
+#[path = "queue_slots.rs"]
+mod queue_slots;
+use queue_slots::QueueSlots;
+
 /// What the queue of textures picked by index knows of a title slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Waiting {
@@ -1191,7 +1195,7 @@ fn host_texture_left_out() {
 /// which order (no host heap needed, so it is tested without one).
 #[derive(Default)]
 pub(crate) struct TextureQueue {
-    slots: std::collections::BTreeMap<u32, Waiting>,
+    slots: QueueSlots,
     writes: u64,
     /// Slots held back because the card had no room for the host copy
     /// they need ([`TextureQueue::hold`]), each with the write it was
@@ -1228,7 +1232,7 @@ impl TextureQueue {
     /// the host slot from a view the queue may hold already, which then
     /// stays as it is.
     fn written(&mut self, index: u32, frame: u64, due: u64, seen: bool) {
-        if seen && self.slots.contains_key(&index) {
+        if seen && self.slots.get(&index).is_some() {
             return;
         }
         self.writes += 1;
@@ -1264,9 +1268,16 @@ impl TextureQueue {
     /// title's recording threads, whose every descriptor copy notes its slot
     /// here, waited that long behind it (run timeline, 2026-11-26).
     fn due_and_census(&self, frame: u64) -> (Due, [u64; 6]) {
+        match &self.slots {
+            QueueSlots::Tree(m) => Self::scan(m.iter(), frame),
+            QueueSlots::Dense(m) => Self::scan(m.iter(), frame),
+        }
+    }
+
+    fn scan<'a>(entries: impl ExactSizeIterator<Item = (&'a u32, &'a Waiting)>, frame: u64) -> (Due, [u64; 6]) {
         let mut due = Due::default();
-        let mut c = [self.slots.len() as u64, 0, 0, 0, 0, 0];
-        for (&index, w) in &self.slots {
+        let mut c = [entries.len() as u64, 0, 0, 0, 0, 0];
+        for (&index, w) in entries {
             let again = w.checked.2 != 0;
             if w.mapped > 0 {
                 c[3] += 1;
@@ -1290,6 +1301,23 @@ impl TextureQueue {
             }
         }
         (due, c)
+    }
+
+    /// The accounting pass consumes slots in ascending slot order. Let go
+    /// of the queue before restoring that order for the dense entries.
+    fn all_due(queue: impl std::ops::Deref<Target = Self>, frame: u64) -> Vec<(u32, bool)> {
+        let mut due = Vec::new();
+        queue.slots.visit(|index, w| {
+            if w.due <= frame {
+                due.push((index, w.mapped > 0 || w.checked.2 != 0));
+            }
+        });
+        let dense = matches!(queue.slots, QueueSlots::Dense(_));
+        drop(queue);
+        if dense {
+            due.sort_unstable_by_key(|(index, _)| *index);
+        }
+        due
     }
 }
 
@@ -1334,7 +1362,8 @@ impl Due {
     /// each when they were taken.
     fn ordered(self, max: usize) -> (Vec<(u32, u64)>, Vec<Option<Checked>>) {
         let Due { mut again, mut fresh } = self;
-        // By the number of the write, counted over the run.
+        // Each write gets its own number, including writes in the same
+        // frame, so scan order cannot break a priority tie.
         again.sort_unstable_by(|a, b| b.2.cmp(&a.2));
         fresh.sort_unstable_by(|a, b| b.2.cmp(&a.2));
         let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write, _)| (index, write)).collect();
@@ -1463,7 +1492,7 @@ impl TextureQueue {
     #[cfg(test)]
     fn census(&self, frame: u64) -> [u64; 6] {
         let mut c = [self.slots.len() as u64, 0, 0, 0, 0, 0];
-        for w in self.slots.values() {
+        self.slots.visit(|_, w| {
             let again = w.checked.2 != 0;
             if w.mapped > 0 {
                 c[3] += 1;
@@ -1478,7 +1507,7 @@ impl TextureQueue {
                     c[4] = c[4].max(frame.saturating_sub(w.written));
                 }
             }
-        }
+        });
         c
     }
 
@@ -2414,13 +2443,7 @@ impl HostHeap {
     /// look): for the card accounting line
     /// (`crate::resource::card_accounting`).
     pub(crate) fn texture_slots_all_due(&self, frame: u64) -> Vec<(u32, bool)> {
-        let textures = self.queue(super::queue_site::OTHER);
-        textures
-            .slots
-            .iter()
-            .filter(|(_, w)| w.due <= frame)
-            .map(|(&index, w)| (index, w.mapped > 0 || w.checked.2 != 0))
-            .collect()
+        TextureQueue::all_due(self.queue(super::queue_site::OTHER), frame)
     }
 
     /// The texture view of title slot `index` (as handed out with `write`)
@@ -6720,6 +6743,50 @@ mod tests {
             assert_eq!(a.texture_slot_checked(i), b.texture_slot_checked(i));
             assert_eq!(a.texture_slot_mapped(i), b.texture_slot_mapped(i));
             assert_eq!(a.texture_slot_write(i).map(|w| w != 0), b.texture_slot_write(i).map(|w| w != 0));
+        }
+    }
+
+    #[test]
+    fn dense_texture_slots_match_the_tree_after_rewrites_and_removals() {
+        let mut queues = [false, true].map(|dense| TextureQueue {
+            slots: QueueSlots::new(dense),
+            marks: std::sync::Arc::new(QueueMarks::new(128)),
+            ..Default::default()
+        });
+        let mut random = 27u32;
+        for round in 0..2000u64 {
+            random = random.wrapping_mul(1664525).wrapping_add(1013904223);
+            let index = (random >> 12) % 64;
+            let frame = round / 9;
+            let write = queues[0].marks.get(index).unwrap();
+            // Completions can return after another write to the same slot.
+            let called = if random & 16 == 0 { write.saturating_sub(1) } else { write };
+            for q in &mut queues {
+                match random % 10 {
+                    0 | 1 => q.written(index, frame, frame + 1, random & 32 == 0),
+                    2 => q.changed(index, frame, frame),
+                    3 => q.hold(index, called, frame + 8),
+                    4 => q.partly(index, called, frame + 2, 4096),
+                    5 => q.recheck(index, called, frame, (0x10000, 4096), 9, 2, frame),
+                    6 => q.later(index, called, frame, 8),
+                    7 => q.done(index, called),
+                    8 => q.remove(index),
+                    _ => { q.room(frame); }
+                }
+            }
+            let [tree, dense] = &queues;
+            assert_eq!(tree.slots.get(&index), dense.slots.get(&index));
+            assert_eq!(tree.marks.get(index), dense.marks.get(index));
+            assert_eq!(tree.held, dense.held);
+            if round % 23 == 0 {
+                for at in [frame, frame + 8] {
+                    let (a, ac) = tree.due_and_census(at);
+                    let (b, bc) = dense.due_and_census(at);
+                    assert_eq!(ac, bc);
+                    assert_eq!(a.ordered(usize::MAX), b.ordered(usize::MAX));
+                    assert_eq!(TextureQueue::all_due(tree, at), TextureQueue::all_due(dense, at));
+                }
+            }
         }
     }
 
