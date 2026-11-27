@@ -40,6 +40,8 @@ param(
     # The streaming and submitting-thread switches (each described where the code reads it), all on at once.
     # Newer than the settings above and not yet measured in the world one by one; -More turns any of them off.
     [switch]$Fast,
+    # Reserve CPU time for submission on the eight-core Ryzen test system.
+    [switch]$Ryzen3700X,
     [hashtable]$More = @{}
 )
 $repo = Split-Path $PSScriptRoot -Parent
@@ -93,7 +95,7 @@ $settings = @{
     # Pipelines the title makes are written down, so `victory warm` can make them ahead
     VICTORY_PIPELINE_BOOK = '1'
 }
-if ($Fast) {
+if ($Fast -or $Ryzen3700X) {
     # Host pipelines: no wait that cannot end in the frame, none while a backlog is queued, extra threads for the
     # slow ones while nothing is asked
     $settings.VICTORY_PIPELINE_WAIT_ONCE = '1'; $settings.VICTORY_PIPELINE_WAIT_BACKLOG = '64'
@@ -117,6 +119,17 @@ if ($Fast) {
     # The submitting thread: refresh sets, refreshes kept across title writes, page parts, sending on its own thread
     $settings.VICTORY_REFRESH_SET = '1'; $settings.VICTORY_TITLE_WRITE_RANGE = '1'
     $settings.VICTORY_UNDER_PARTS = '1'; $settings.VICTORY_SEND_THREAD = '1'
+}
+if ($Ryzen3700X) {
+    $settings.VICTORY_RYZEN_PREP = '1'
+    $settings.VICTORY_PIPELINE_SLOW_WORKERS = '2'
+    # Per buffer kind. On the 8 GB card keep transient uploads bounded.
+    $settings.VICTORY_UPLOAD_POOL_MB = '96'
+    $settings.VICTORY_SECTION_MB = '2'
+    $settings.VICTORY_WATCH_INDEX = '1'
+    # Keep recording on the game's threads for the prison geometry.
+    $settings.Remove('VICTORY_THIN')
+    $settings.Remove('VICTORY_JOIN_PARTS')
 }
 if (-not $SeriesS) {
     if ($Res -eq '1440') { $settings.VICTORY_NATIVE_1440P = '1' }
@@ -156,7 +169,7 @@ $settings.VICTORY_MENU_FRAMEGEN = if ($settings.VICTORY_FRAMEGEN -eq '1') { [str
 $settings.VICTORY_MENU_FPS = [string]$fpsWanted
 $settings.VICTORY_MENU_FILE = $menuFile
 $settings.VICTORY_MENU_PLAY = $MyInvocation.MyCommand.Path
-$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($NoFrameGenReady) { ' -NoFrameGenReady' })$(if ($Fast) { ' -Fast' })"
+$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($NoFrameGenReady) { ' -NoFrameGenReady' })$(if ($Fast) { ' -Fast' })$(if ($Ryzen3700X) { ' -Ryzen3700X' })"
 
 $victory = Join-Path $repo "target\$Build\victory.exe"
 if (-not (Test-Path $victory)) {

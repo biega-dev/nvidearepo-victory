@@ -61,12 +61,26 @@ impl Slots {
     }
 
     /// Those that `which` says, in order.
-    fn all(&self, which: impl Fn(u32) -> bool) -> Vec<u32> {
+    /// Those selected by the word mask and predicate, in slot order.
+    fn selected(&self, mask: u64, which: impl Fn(u32) -> bool) -> Vec<u32> {
         let mut out = Vec::new();
         for (n, bits) in self.0.iter().enumerate() {
-            Self::of(n, bits.load(std::sync::atomic::Ordering::Acquire), &mut out, &which);
+            Self::of(n, bits.load(std::sync::atomic::Ordering::Acquire) & mask, &mut out, &which);
         }
         out
+    }
+
+    fn partition(&self, part: u32, parts: u32) -> Vec<u32> {
+        if crate::toggled!("VICTORY_RYZEN_PREP") && parts.is_power_of_two() && parts <= 64 && part < parts {
+            // The same positions belong to this partition in every 64-slot word.
+            let mask = (part..64).step_by(parts as usize).fold(0, |bits, i| bits | (1u64 << i));
+            return self.selected(mask, |_| true);
+        }
+        self.selected(u64::MAX, |slot| slot % parts == part)
+    }
+
+    fn all(&self, which: impl Fn(u32) -> bool) -> Vec<u32> {
+        self.selected(u64::MAX, which)
     }
 
     /// All of them, and none is left.
@@ -3297,7 +3311,7 @@ impl HostHeap {
     /// Of [`HostHeap::buffer_slots`], those of one of `parts` parts: every
     /// slot is in the same part each time.
     pub(crate) fn buffer_slots_of(&self, part: u32, parts: u32) -> Vec<u32> {
-        self.buffers.all(|slot| slot % parts == part)
+        self.buffers.partition(part, parts)
     }
 
     /// The title slots whose buffer view was written, or went, since the

@@ -841,7 +841,7 @@ pub(crate) fn copy_all(copies: Vec<(usize, usize, usize)>) {
     }
     let bytes: usize = copies.iter().map(|c| c.2).sum();
     if bytes > 4 << 20 {
-        wide(copy_jobs(copies));
+        wide(copy_jobs(copies, false));
         return;
     }
     for (src, dst, len) in copies {
@@ -1871,12 +1871,47 @@ pub(crate) fn take_snapshots() {
     if snaps.is_empty() {
         return;
     }
-    wide(copy_jobs(snaps));
+    #[cfg(target_arch = "x86_64")]
+    let stream = crate::toggled!("VICTORY_RYZEN_PREP") && std::is_x86_feature_detected!("avx");
+    #[cfg(not(target_arch = "x86_64"))]
+    let stream = false;
+    wide(copy_jobs(snaps, stream));
+}
+
+/// A snapshot is read back after the GPU submission. Stream its complete
+/// cache lines into system memory without first fetching their old contents.
+///
+/// # Safety
+/// AVX must be available. The ranges are valid for `len` and do not overlap.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn stream_snapshot(src: *const u8, dst: *mut u8, len: usize) {
+    use std::arch::x86_64::{_mm_sfence, _mm256_loadu_si256, _mm256_stream_si256};
+    let head = dst.align_offset(64).min(len);
+    // SAFETY: only full aligned lines receive streaming stores. The ordinary
+    // copies cover the edges, including any bytes shared with another job's line.
+    unsafe {
+        std::ptr::copy_nonoverlapping(src, dst, head);
+        let mut at = head;
+        while len - at >= 128 {
+            for offset in [0, 32, 64, 96] {
+                let bytes = _mm256_loadu_si256(src.add(at + offset).cast());
+                _mm256_stream_si256(dst.add(at + offset).cast(), bytes);
+            }
+            at += 128;
+        }
+        std::ptr::copy_nonoverlapping(src.add(at), dst.add(at), len - at);
+        // Publish the weakly ordered stores before this worker reports completion.
+        _mm_sfence();
+    }
 }
 
 /// `copies` (from, to, bytes) as pieces of work of about [`WIDE_JOB`]
 /// bytes each: long ones cut, short ones together.
-fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
+fn copy_jobs(copies: Vec<(usize, usize, usize)>, stream: bool) -> Vec<Job> {
+    // A small submission's mapping and snapshot can both stay in cache.
+    // On a 3700X ordinary copies won up to 8 MiB, streaming from 10 MiB.
+    let stream = stream && copies.iter().map(|c| c.2).sum::<usize>() >= 10 << 20;
     let mut jobs: Vec<Job> = Vec::new();
     let mut group: Vec<(usize, usize, usize)> = Vec::new();
     let mut bytes = 0;
@@ -1885,6 +1920,15 @@ fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
         if !group.is_empty() {
             jobs.push(Box::new(move || {
                 for (src, dst, len) in group {
+                    // Small ranges are often reused from cache. Leave them
+                    // on the native copy path, as well as non-snapshot copies.
+                    #[cfg(target_arch = "x86_64")]
+                    if stream && len >= 64 << 10 {
+                        // SAFETY: take_snapshots checked AVX, and these are
+                        // disjoint ranges of the mapping and its snapshot.
+                        unsafe { stream_snapshot(src as *const u8, dst as *mut u8, len) };
+                        continue;
+                    }
                     // SAFETY: the caller's ranges: a host copy's mapping and
                     // its snapshot, which do not overlap.
                     unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
@@ -2079,7 +2123,7 @@ mod wide_tests {
         // Ranges of the buffer, each to the same offsets of the other.
         let cuts = [0, 1, 1, 4096, 70_000, WIDE_JOB + 3, 2 * WIDE_JOB + 3, 2 * WIDE_JOB + 9, len];
         let copies: Vec<(usize, usize, usize)> = cuts.windows(2).map(|w| (s + w[0], d + w[0], w[1] - w[0])).collect();
-        let jobs = copy_jobs(copies);
+        let jobs = copy_jobs(copies, false);
         assert!(jobs.len() >= 3);
         wide(jobs);
         assert!(src == dst);

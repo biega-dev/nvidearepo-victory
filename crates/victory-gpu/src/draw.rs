@@ -1138,6 +1138,9 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         crate::book::root(gpu, len);
         return Some(gpu);
     }
+    if let Some((_, gpu)) = list.place_constant(address as usize, len as usize) {
+        return Some(gpu);
+    }
     list.fill_scratch(address as *const u8, len)
 }
 
@@ -2794,7 +2797,7 @@ impl State {
             // copies that texture's texels into it on the host, no upload.
             // (Lighting tables read as R9G9B9E5: 6 to 13 sources a run were
             // counted as failed for want of an upload.)
-            if crate::resource::alias_of(resource).is_some() {
+            if crate::resource::is_aliased(resource) {
                 readable(list, ResourceType::Srv, &view);
                 n[if shown { 2 } else { 5 }] += 1;
                 if !shown {
@@ -4720,6 +4723,10 @@ impl State {
                 let used = group.entry(k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        if let Some((buffer, gpu)) = list.place_constant(address as usize, size as usize) {
+                            host.constant_at(index, &buffer, gpu, size);
+                            continue;
+                        }
                         let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
                             host.make_null(index);
                             continue;
@@ -5965,7 +5972,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // a texture the host writes: that texture's texels, copied on
             // the host (title memory does not have them).
             let aliased = crate::resource::alias_of(*resource as This)
-                .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
+                .is_some_and(|source| crate::texture::alias(list, *resource as This, source.get()));
             if !aliased
                 && let Some(t) = crate::resource::host_copy(*resource as This)
                 && t.flags() & 0x7 == 0

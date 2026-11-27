@@ -13,9 +13,9 @@
 
 #![allow(non_upper_case_globals)]
 
-/// The Agility SDK version the `D3D12` folder holds (1.620.x).
+/// The loader requires the export to match the app-local D3D12Core.dll.
 #[unsafe(no_mangle)]
-pub static D3D12SDKVersion: u32 = 620;
+pub static D3D12SDKVersion: u32 = if cfg!(feature = "agility-614") { 614 } else { 620 };
 
 /// A C string pointer the runtime reads in place.
 #[repr(transparent)]

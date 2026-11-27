@@ -453,6 +453,7 @@ fn sweep() {
     crate::book::check();
     crate::residency::refresh();
     if crate::residency::pressured() {
+        trim_spare_uploads();
         trim_spare_chunks();
     }
     crate::pool::room(host().and_then(|h| h.video_memory()));
@@ -1276,6 +1277,8 @@ pub(crate) struct HostList {
     indirect_run: Mutex<Option<(crate::indirect::merge::Run, Option<crate::indirect::merge::Held>)>>,
     /// Whether an execution is held back.
     holding: std::sync::atomic::AtomicBool,
+    /// Whether this recording has any `Step::Placed` copy (`place::HostList::place_constant`).
+    has_placed: std::sync::atomic::AtomicBool,
     /// The upscaling (`crate::streamline`) recorded in the list, noted for
     /// the present after its submission; 0 for none.
     upscale: std::sync::atomic::AtomicU64,
@@ -2070,15 +2073,83 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     drop(freed);
 }
 
-/// Drops spare scratch chunks kept idle when host memory is pressured.
+/// Copy sources of [`HostList::upload`] no list holds: upload buffers,
+/// then shared buffers, by size class.
+static UPLOAD_SPARE: [Mutex<Spare<Chunk>>; 2] = [const { Mutex::new(Spare::new()) }; 2];
+
+/// The most bytes [`UPLOAD_SPARE`] keeps of each kind
+/// (`VICTORY_UPLOAD_POOL_MB`, 1024; 0: no pool, a buffer per copy as
+/// before). Every copy a list recorded made a buffer of its own and waited
+/// for it to be resident: 19,324 shared buffers and 9.3 s of waits in a
+/// 5-minute session (RTX 4090).
+fn upload_pool_most() -> u64 {
+    static MB: OnceLock<u64> = OnceLock::new();
+    *MB.get_or_init(|| {
+        std::env::var("VICTORY_UPLOAD_POOL_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1024)
+    }) << 20
+}
+
+fn take_upload(shared: bool, class: u64) -> Option<Chunk> {
+    UPLOAD_SPARE[usize::from(shared)].lock().unwrap_or_else(|e| e.into_inner()).take(class)
+}
+
+/// The upload heap holds a mapped source until its list is reset. Only
+/// round the allocation up when the pool can actually reuse that size.
+fn pooled_upload_class(size: u64, budget: u64) -> Option<u64> {
+    size.max(64 << 10).checked_next_power_of_two().filter(|&class| class <= budget)
+}
+
+/// The copy sources of a list whose submissions have run.
+fn give_uploads(pooled: Vec<(Chunk, u64, bool)>) {
+    if pooled.is_empty() {
+        return;
+    }
+    let most = upload_pool_most();
+    let mut freed = Vec::new();
+    for (chunk, class, shared) in pooled {
+        if let Some(chunk) = UPLOAD_SPARE[usize::from(shared)].lock().unwrap_or_else(|e| e.into_inner()).give(chunk, class, most) {
+            freed.push(chunk);
+        }
+    }
+    // Freed outside the lock.
+    drop(freed);
+}
+
+/// Under memory pressure: the kept copy sources down to [`SPARE_MOST`] of
+/// each kind, the ones given last kept.
+fn trim_spare_uploads() {
+    let mut freed = Vec::new();
+    for spare in &UPLOAD_SPARE {
+        let mut spare = spare.lock().unwrap_or_else(|e| e.into_inner());
+        while spare.bytes > SPARE_MOST && !spare.kept.is_empty() {
+            let (chunk, size) = spare.kept.remove(0);
+            spare.bytes -= size;
+            freed.push(chunk);
+        }
+    }
+    drop(freed);
+}
+
+/// Spare scratch chunks kept idle, down to [`SPARE_MOST`], when host memory
+/// is pressured.
 fn trim_spare_chunks() {
     let freed: Vec<(Chunk, u64)> = {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         if spare.kept.is_empty() {
             return;
         }
-        spare.bytes = 0;
-        std::mem::take(&mut spare.kept)
+        // The chunks given last are kept. All of them went every second
+        // while the pressure lasted, and new lists made them again at once:
+        // with 64 GB and a system-managed page file the commit headroom stays
+        // under 4 GiB while the title runs (RTX 4090: 12,925 chunks, 13.5 GB
+        // and 7.7 s of waits in a 5-minute session).
+        let mut freed = Vec::new();
+        while spare.bytes > SPARE_MOST && !spare.kept.is_empty() {
+            let (chunk, size) = spare.kept.remove(0);
+            spare.bytes -= size;
+            freed.push((chunk, size));
+        }
+        freed
     };
     let count = freed.len() as u64;
     let bytes: u64 = freed.iter().map(|(_, s)| *s).sum();
@@ -2386,6 +2457,10 @@ struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
+    /// Copy sources from [`HostList::upload`]'s pool: the buffer, its size
+    /// class, whether it is a shared buffer. Given back to the pool when the
+    /// list is reset.
+    pooled: Vec<(Chunk, u64, bool)>,
     /// Standalone upload footprints kept through this list's fence (movie planes).
     plane_uploads: Vec<(Chunk, u64)>,
     /// Title textures whose upload the list's prelude records if the check at
@@ -2432,6 +2507,12 @@ struct Deferred {
     /// indirect arguments; 0 if none. It stays readable until the next
     /// clamp into it ([`HostList::indirect_state`]).
     indirect_readable: usize,
+    /// Ranges `[dst, dst + len)` written on the GPU by `Step::Placed` in
+    /// this recording, in order, with the destination host copy.
+    placed_written: Vec<(usize, usize, std::sync::Arc<crate::shadow::Shadow>)>,
+    /// Current per-recording GPU buffer `(buffer, capacity, used)` for
+    /// inline placed constant snapshots ([`place`]).
+    placed_cbv: Option<(ID3D12Resource, u64, u64)>,
 }
 
 impl Deferred {
@@ -2456,6 +2537,7 @@ impl Deferred {
 impl Drop for Deferred {
     fn drop(&mut self) {
         give_chunks(std::mem::take(&mut self.plane_uploads));
+        give_uploads(std::mem::take(&mut self.pooled));
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
     }
@@ -3887,12 +3969,15 @@ fn late_line(frames: f64) {
     crate::land::log(frames);
     if place::on() {
         let t: Vec<f64> = place::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        let constants = place::CONSTANTS.swap(0, Ordering::Relaxed) as f64 / frames;
         tracing::info!(
-            "title buffer copies at their place in the lists, per frame (VICTORY_COPIES_IN_PLACE): {:.1} of {:.1} KB, {:.1} of them out              of what shaders wrote; {:.2} copies into textures out of what shaders wrote",
+            "title buffer copies at their place in the lists, per frame (VICTORY_COPIES_IN_PLACE): {:.1} of {:.1} KB, {:.1} of them out \
+             of what shaders wrote; {:.2} copies into textures out of what shaders wrote; {:.1} constants read in place",
             t[0],
             t[1] / 1024.0,
             t[2],
             t[3],
+            constants,
         );
     }
     card_steps::log(frames);
@@ -3914,6 +3999,7 @@ fn late_line(frames: f64) {
 }
 
 pub(crate) mod aside;
+mod frame_log;
 pub(crate) mod awake;
 mod card_steps;
 pub(crate) mod indirects;
@@ -4350,6 +4436,7 @@ impl Host {
                 title_calls: std::sync::atomic::AtomicU64::new(0),
                 indirect_run: Mutex::default(),
                 holding: std::sync::atomic::AtomicBool::new(false),
+                has_placed: std::sync::atomic::AtomicBool::new(false),
                 upscale: std::sync::atomic::AtomicU64::new(0),
                 hudless: std::sync::atomic::AtomicU64::new(0),
                 left_open: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
@@ -6717,6 +6804,7 @@ impl HostList {
         let left_open = self.still_left_open();
         self.changed_something();
         self.holding.store(false, Ordering::Relaxed);
+        self.has_placed.store(false, Ordering::Relaxed);
         *self.indirect_run.lock().unwrap_or_else(|e| e.into_inner()) = None;
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
@@ -7280,6 +7368,7 @@ impl HostList {
             let deferred = self.deferred();
             if !(deferred.copies.is_empty()
                 && deferred.uploads.is_empty()
+                && deferred.pooled.is_empty()
                 && deferred.kept.is_empty()
                 && deferred.textures.is_empty()
                 && deferred.writes.is_empty()
@@ -7332,6 +7421,8 @@ impl HostList {
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
         let mut deferred = self.deferred();
+        let copy_dst = dst as usize;
+        deferred.placed_written.retain(|(a, b, _)| *b <= copy_dst || *a >= copy_dst.saturating_add(len));
         COPIES_JOINED[0].fetch_add(1, Ordering::Relaxed);
         // A copy that goes on where the one recorded just before it ended,
         // source and destination both: with `join_copies` the two are one
@@ -7451,13 +7542,27 @@ impl HostList {
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
-    /// A mapped upload buffer of `size` bytes, alive until the list is
-    /// reset.
-    ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
+    /// A mapped upload buffer of at least `size` bytes, alive until the list
+    /// is reset: from a pool by size class ([`UPLOAD_SPARE`]), so that it may
+    /// hold what an earlier list wrote. Callers write or zero the bytes they
+    /// use and copy by offset, never the whole buffer.
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         // With [`card_steps`] the card may be the one that fills it.
-        let (buffer, data) = if card_steps::stage() > 1 { host.shared_buffer(size)? } else { host.upload_buffer(size)? };
+        let shared = card_steps::stage() > 1;
+        if let Some(class) = pooled_upload_class(size, upload_pool_most()) {
+            let chunk = match take_upload(shared, class) {
+                Some(chunk) => chunk,
+                None => {
+                    let (buffer, data) = if shared { host.shared_buffer(class)? } else { host.upload_buffer(class)? };
+                    name(&buffer, || format!("list upload, pooled {class:#x}"));
+                    Chunk { buffer, data: data as usize }
+                }
+            };
+            let out = (chunk.buffer.clone(), chunk.data as *mut u8);
+            self.deferred().pooled.push((chunk, class, shared));
+            return Some(out);
+        }
+        let (buffer, data) = if shared { host.shared_buffer(size)? } else { host.upload_buffer(size)? };
         name(&buffer, || format!("list upload {size:#x}"));
         self.deferred().hold_upload(buffer.clone(), size);
         Some((buffer, data))
@@ -9666,6 +9771,7 @@ struct Presenter {
 pub(crate) static METER_FPS_TENTHS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 struct Meter {
+    frame_log: Option<frame_log::FrameLog>,
     since: std::time::Instant,
     frames: u32,
     #[cfg(feature = "diagnostics")]
@@ -9680,6 +9786,7 @@ impl Meter {
     fn new() -> Self {
         let now = std::time::Instant::now();
         Meter {
+            frame_log: frame_log::FrameLog::open(now, crate::draw::drawn()),
             since: now,
             frames: 0,
             #[cfg(feature = "diagnostics")]
@@ -9697,6 +9804,9 @@ impl Meter {
 
     /// Counts a presented frame.
     fn frame(&mut self, hwnd: HWND) {
+        if let Some(log) = &mut self.frame_log {
+            log.present(std::time::Instant::now(), crate::draw::drawn());
+        }
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
@@ -11218,6 +11328,16 @@ mod trail {
 #[cfg(test)]
 mod spare {
     use super::Spare;
+
+    #[test]
+    fn round_only_uploads_the_pool_can_keep() {
+        let budget = 96 << 20;
+        assert_eq!(super::pooled_upload_class(1, 0), None);
+        assert_eq!(super::pooled_upload_class(16, budget), Some(64 << 10));
+        assert_eq!(super::pooled_upload_class(64 << 20, budget), Some(64 << 20));
+        assert_eq!(super::pooled_upload_class((64 << 20) + 1, budget), None);
+        assert_eq!(super::pooled_upload_class(u64::MAX, u64::MAX), None);
+    }
 
     /// Kept things come back by size, the last given first, and nothing is
     /// kept past the limit.
