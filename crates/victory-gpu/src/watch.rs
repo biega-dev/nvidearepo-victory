@@ -33,6 +33,7 @@ use std::sync::{Condvar, Mutex, RwLock};
 
 mod epochs;
 use epochs::Epochs;
+pub(crate) mod memo;
 
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
@@ -62,6 +63,9 @@ impl Journal {
     /// Page `page` was found written by asking `now`: the parts in `parts`
     /// (a bit each). The asking that found it written before (0: none).
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
+        if let Some(writes) = self.memo_writes {
+            writes.record(page, now);
+        }
         let before = self.written.record(page, now);
         if parts == WHOLE || !parts_on() {
             self.parts.remove(&page);
@@ -89,6 +93,9 @@ impl Journal {
 /// the asking it took the page at): the parts to take again, a bit for each
 /// 4 KiB, in the same order.
 pub(crate) fn parts_written(pages: &[(usize, u64)]) -> Vec<u16> {
+    if pages.is_empty() && memo::enabled() {
+        return Vec::new();
+    }
     let j = journal();
     pages.iter().map(|&(page, taken)| j.parts_since(page, taken)).collect()
 }
@@ -209,6 +216,8 @@ impl AskedRanges {
 }
 
 struct Journal {
+    /// Published under this writer's lock before a dirty page is observable.
+    memo_writes: Option<&'static memo::Writes>,
     /// Page number → the asking that last found it written.
     written: Epochs,
     /// The same for each of a page's sixteen parts ([`KERNEL_PAGE`]), where
@@ -233,6 +242,7 @@ struct Journal {
 /// the submitting thread, and one in six of those at the six threads beside
 /// it, found it waiting for that lock (run pooloff1).
 static JOURNAL: std::sync::LazyLock<RwLock<Journal>> = std::sync::LazyLock::new(|| RwLock::new(Journal {
+    memo_writes: (cfg!(test) || memo::enabled()).then_some(&memo::WRITES),
     // VICTORY_WATCH_BLOCKS=1 keeps last-write numbers together for 64
     // adjacent pages. A refresh in the prison asked about some 5,500 ranges
     // a frame. The same lock and the same guard/asking decide what is known.
@@ -466,6 +476,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     note_hot(&written);
     let ahead = AskedRanges::new(asked, watch_index());
     let mut j = journal_mut();
+    memo::set_ahead(0);
     j.ahead_asked = next_asking();
     j.ahead = ahead;
     let now = j.ahead_asked;
@@ -614,6 +625,7 @@ fn ask_early(every: std::time::Duration) {
 pub(crate) fn ask_ahead_done() {
     let mut j = journal_mut();
     if !j.kept {
+        memo::set_ahead(0);
         j.ahead.clear();
     }
 }
@@ -720,6 +732,7 @@ fn ask_rest_in_order(ranges: &[(usize, usize)]) {
     let _all = Asking::hold_all();
     let mut ahead = {
         let mut j = journal_mut();
+        memo::set_ahead(0);
         std::mem::take(&mut j.ahead)
     };
     // `ask_ahead` leaves a range that lies alone to `writes`, which asks
@@ -746,6 +759,9 @@ fn ask_rest_in_order(ranges: &[(usize, usize)]) {
     }
     j.kept = !ahead.ranges.is_empty();
     j.ahead = ahead;
+    if j.kept {
+        memo::set_ahead(now);
+    }
 }
 
 /// The submission's one asking stands no longer: its refreshes are done,
@@ -753,6 +769,7 @@ fn ask_rest_in_order(ranges: &[(usize, usize)]) {
 pub(crate) fn ask_once_end() {
     let mut j = journal_mut();
     if j.kept {
+        memo::set_ahead(0);
         j.kept = false;
         j.ahead.clear();
     }
@@ -936,7 +953,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// taken whole, or 0) does not hold, as [`writes`] would answer with nothing
 /// asked: the submission's asking covers the range, or its blocks are known
 /// by their bits. `false` if something would have to be asked.
-pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64], ranged: u64) -> bool {
+pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64], ranged: u64, remember: Option<memo::CopyKey>) -> bool {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     // The bits first, then the journal, as in `writes`.
     let known = published(start, end);
@@ -951,7 +968,16 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
         return false;
     };
-    j.written.unchanged(first, taken, ranged)
+    let same = j.written.unchanged(first, taken, ranged);
+    if same && let Some(copy) = remember {
+        // The page comparisons and this clock are under the same journal
+        // read lock. No later journal write can have this asking's number.
+        let ahead = if known { 0 } else { memo::AHEAD.load(Ordering::Acquire) };
+        if known || ahead != 0 {
+            memo::remember(copy, start, end, base, ASKED.load(Ordering::Relaxed), ahead);
+        }
+    }
+    same
 }
 
 impl Tracked {
@@ -1557,6 +1583,7 @@ fn placeholder(block: usize) -> bool {
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
 /// committed: what was known of holes there is asked again.
 pub fn title_memory_allocated(at: usize, len: usize) {
+    memo::mapping_changed();
     if len == 0 || !known_holes() {
         return;
     }
@@ -2761,6 +2788,7 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
 /// again - and are, the pages noted written, which also has the next check
 /// guard the new view ([`cover`]).
 pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
+    memo::mapping_changed();
     if !view_guard() {
         return;
     }
@@ -2788,6 +2816,7 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
 /// ([`views_mapped`]). What is guarded of its pages at other views is opened,
 /// and not guarded again before the change is done ([`Remapping`]).
 pub fn title_memory_splitting(at: usize, len: usize) {
+    memo::mapping_changed();
     let others: Vec<usize> = elsewhere(at, len).into_iter().flat_map(|(_, others)| others).collect();
     if others.is_empty() {
         return;
@@ -3056,6 +3085,7 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
+    memo::mapping_changed();
     crate::shadow::write_combined_freed(at, len);
     let mut g = guards();
     let first = at / BLOCK;
@@ -3110,6 +3140,7 @@ fn allocation_end(at: usize, inside: usize) -> usize {
 /// Tells what keeps track of what title memory shows; the guards, with no
 /// block of the range known unmapped.
 fn title_memory_changed(at: usize, len: usize) -> std::sync::MutexGuard<'static, Guards> {
+    memo::mapping_changed();
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
@@ -3244,6 +3275,7 @@ pub fn soft_view_guards() -> [u64; 2] {
 /// the view is there (as [`title_memory_remapped`] is), with the runtime's
 /// lock on its views held.
 pub fn title_memory_made_real(at: usize, len: usize) {
+    memo::mapping_changed();
     if len == 0 {
         return;
     }
@@ -3450,6 +3482,7 @@ mod parts_tests {
     #[test]
     fn the_parts_of_a_page_written_since_it_was_taken() {
         let mut j = Journal {
+            memo_writes: None,
             written: Epochs::new(false),
             parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
             ahead: AskedRanges::EMPTY,
@@ -4320,6 +4353,30 @@ mod tests {
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
         assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
         drop_views(section, &[guarded, other], SIZE);
+    }
+
+    #[test]
+    fn a_memoized_partial_poll_expires_on_an_alias_write_republication_and_remap() {
+        let (section, at, alias) = two_views(PAGE);
+        let (from, to) = (at + 8, at + 48);
+        let key = || super::memo::CopyKey::new(u64::MAX, 1);
+        let (first, _) = writes(at, at + PAGE, true).expect("guarded view");
+        let poll = |ranged| super::nothing_new(from, to, at / PAGE, &[0], ranged, Some(key()));
+        let hit = || super::memo::holds(key(), from, to, at / PAGE);
+        // Other tests can invalidate a stripe or the mapping generation.
+        let confirmed = |ranged| (0..128).any(|_| poll(ranged) && hit());
+        assert!(!poll(0), "first touch");
+        assert!(confirmed(first));
+        assert!(!super::memo::holds(key(), from, to + 1, at / PAGE), "uncopied suffix");
+        // SAFETY: our other view of the same writable section.
+        unsafe { ((alias + 10) as *mut u8).write_volatile(7) };
+        assert!(!hit(), "the alias removed the published guard");
+        let (second, _) = writes(at, at + PAGE, true).expect("guarded again");
+        assert!(!hit() && !poll(first), "its new journal entry outlives the guard change");
+        assert!(confirmed(second));
+        super::title_memory_unmapping(at, PAGE);
+        assert!(!hit(), "the mapping was revoked");
+        drop_views(section, &[at, alias], PAGE);
     }
 
     /// A view of guarded pages is mapped anew: it is writable, so the

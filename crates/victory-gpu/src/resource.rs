@@ -2057,10 +2057,20 @@ pub(crate) fn room_percent() -> u64 {
 pub(crate) fn room_line(budget: u64) -> u64 {
     static SET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *SET.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_ROOM_PERCENT").is_some()) {
-        budget / 100 * room_percent()
-    } else {
-        line_for(budget)
+        return budget / 100 * room_percent();
     }
+    // VICTORY_FG_ROOM_PERCENT is the automatic reservation, separate from
+    // the explicit texture budget above. A rejected 6x request on the 3070
+    // had kept 20% for a feature that allocated no frames.
+    static FG: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let fg = *FG.get_or_init(|| std::env::var("VICTORY_FG_ROOM_PERCENT").ok()
+        .and_then(|v| v.trim().parse::<u64>().ok()).map(|n| n.clamp(50, 97)));
+    fg_room_line(budget, fg, fg.is_some() && crate::streamline::framegen_ruled_out())
+}
+
+#[cfg(any(windows, test))]
+fn fg_room_line(budget: u64, percent: Option<u64>, ruled_out: bool) -> u64 {
+    if let Some(percent) = percent.filter(|_| !ruled_out) { budget / 100 * percent } else { line_for(budget) }
 }
 
 /// The budget less what is left free for the host's own needs that are
@@ -4894,6 +4904,14 @@ float4 lit() : SV_Target { return 1.0; }
         // 6 GB: 90 % (768 MiB would be more than a tenth).
         assert_eq!(line_for(6_000 * MIB), 6_000 * MIB / 100 * 90);
         assert_eq!(line_for(0), 0);
+    }
+
+    #[test]
+    fn automatic_generation_headroom_is_released_if_the_driver_rejects_it() {
+        let budget = 7_000u64 << 20;
+        assert_eq!(fg_room_line(budget, Some(80), false), budget / 100 * 80);
+        assert_eq!(fg_room_line(budget, Some(80), true), line_for(budget));
+        assert_eq!(fg_room_line(budget, None, false), line_for(budget));
     }
 
     /// The room kept for render targets goes once the world's targets are

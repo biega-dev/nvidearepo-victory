@@ -90,9 +90,13 @@ pub(super) struct Check {
 
 impl Check {
     /// For `landed`, parts of pieces that `plans` may have written, whose
-    /// compares' results are in `differs`: the parts are given their places
+    /// compares' dwords are read by `result`: the parts are given their places
     /// in the pieces that come down.
-    pub(super) fn new<'a>(plans: impl Iterator<Item = &'a CardPlan>, differs: &[u32], landed: &mut [Landed]) -> Check {
+    pub(super) fn new<'a>(
+        plans: impl Iterator<Item = &'a CardPlan>,
+        result: impl Fn(u32) -> Option<u32>,
+        landed: &mut [Landed],
+    ) -> Check {
         let mut index: HashMap<Piece, usize> = HashMap::new();
         let (mut copies, mut of, mut within, mut total) = (Vec::new(), Vec::new(), Vec::new(), 0u64);
         for (shadow, lo, _, at) in landed {
@@ -112,7 +116,7 @@ impl Check {
         for r in plans.flat_map(|plan| &plan.ranges).filter(|r| r.compared && !r.picked) {
             for p in 0..r.span.pieces {
                 if let Some(&i) = index.get(&(r.shadow.id(), r.span.first + p))
-                    && let Some(&d) = differs.get((r.at + p) as usize)
+                    && let Some(d) = result(r.at + p)
                 {
                     of[i].1 = Some(folded(d));
                 }

@@ -9,6 +9,7 @@
 //! colours (`victory play` names one for each start).
 
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::Layer;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -53,13 +54,19 @@ pub fn init(default_level: &str) {
                 .with_ansi(false)
                 .with_writer(std::sync::Mutex::new(file))
         });
+    // The complete file stays available for timings. Repeatedly streaming
+    // the same telemetry to the Windows console also occupied the launcher.
+    let console_cap = if file.is_some() && std::env::var_os("VICTORY_LOG_CONSOLE_WARN").is_some_and(|v| v == "1") {
+        LevelFilter::WARN
+    } else { CAP };
     let _ = tracing_subscriber::registry()
         .with(CAP)
         .with(filter)
         .with(
             tracing_subscriber::fmt::layer()
                 .with_target(true)
-                .with_writer(std::io::stderr),
+                .with_writer(std::io::stderr)
+                .with_filter(console_cap),
         )
         .with(file)
         .try_init();
