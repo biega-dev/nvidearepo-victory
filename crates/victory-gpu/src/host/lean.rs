@@ -443,6 +443,13 @@ pub(super) fn polled(by: Poll, shadow: &crate::shadow::Shadow, address: usize, l
     nothing
 }
 
+/// Count the same buffer checks once per group; detailed per-call timing
+/// selects the individual path in `shadow::batch_refreshes`.
+pub(super) fn polled_group(by: Poll, spans: &[crate::shadow::RefreshSpan]) -> u16 {
+    POLLED[by as usize][0].fetch_add(spans.len() as u64, Ordering::Relaxed);
+    crate::shadow::clean_mask(spans)
+}
+
 /// What made a flush of refreshes happen.
 #[derive(Clone, Copy)]
 pub(super) enum Cause {

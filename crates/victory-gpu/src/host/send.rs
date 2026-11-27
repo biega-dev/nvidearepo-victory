@@ -172,8 +172,8 @@ pub(super) fn give_back(memory: Memory) {
 }
 
 /// Since the last frame-rate line: bytes copied, runs copied, words stored,
-/// microseconds of taking them out of the CPU sides.
-pub(super) static STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// microseconds until the snapshot is ready, and lists recorded during it.
+pub(super) static STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// One copy's sends: ranges copied (offset in the copy, in the memory,
 /// bytes), and its pairs (where in the memory, how many).
@@ -191,10 +191,25 @@ pub(super) struct Own {
 /// Runs whose pairs are one piece of work.
 const RUNS_AT_A_TIME: usize = 4096;
 
-/// Takes what `dirty` sends up out of the CPU sides.
-pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)]) -> Option<Own> {
+/// Take the CPU sides into this submission's upload and record the commands
+/// that will read it. The submitting thread keeps the sources frozen until
+/// return. `record` can use the offsets and GPU addresses, but may not read
+/// the snapshot, execute the list, or call back into the packing workers.
+pub(super) fn take_and_record<R>(
+    host: &Host,
+    dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)],
+    record: impl FnOnce(Option<&Own>) -> R,
+) -> (Option<Own>, R) {
     let began = std::time::Instant::now();
-    pass(host)?;
+    let taking = crate::timeline::span("copies in the card's memory: taken");
+    let took = || {
+        lean::card_part(lean::CardPart::Take, began);
+        taking.end();
+    };
+    if !own() || pass(host).is_none() {
+        took();
+        return (None, record(None));
+    }
     // Runs of whole words of the copy: only those are pairs. (A byte beside
     // them in a word may be the card's.)
     let short = |&(a, b): &(usize, usize)| short(a, b - a);
@@ -205,10 +220,10 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     } else {
         layout::separate(resources)
     };
-    if at == 0 {
-        return None;
-    }
-    let memory = memory(host, at)?;
+    let Some(memory) = (at != 0).then(|| memory(host, at)).flatten() else {
+        took();
+        return (None, record(None));
+    };
     let mut moves: Vec<(usize, usize, usize)> = Vec::new();
     for ((shadow, _), copy) in dirty.iter().zip(&copies) {
         let from = shadow.card_data() as usize;
@@ -236,6 +251,7 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     STATS[0].fetch_add(bulk_bytes, Ordering::Relaxed);
     STATS[1].fetch_add(moves.len() as u64, Ordering::Relaxed);
     STATS[2].fetch_add(copies.iter().map(|c| u64::from(c.pairs.1)).sum(), Ordering::Relaxed);
+    let snapshot = Own { memory, copies };
     // The frozen CPU sides feed disjoint offsets in one upload mapping.
     // Pack the scatter words and copy the long runs in one worker round.
     // The card still reads every byte from this submission's own mapping.
@@ -245,7 +261,7 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     let share_workers = work.len() > 1 || bulk_bytes >= layout::BULK_BYTES as u64;
     if grouped && share_workers && !work.is_empty() && !moves.is_empty() && crate::aspect::target().is_none() {
         let bulk = layout::bulk_parts(&moves);
-        crate::land::each_under(bulk.len() + work.len(), &|i| {
+        let fill = |i: usize| {
             if let Some(part) = bulk.get(i) {
                 for &(src, dst, n) in part {
                     // SAFETY: each range is inside the shadow and its disjoint
@@ -255,13 +271,28 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
             } else {
                 one(i - bulk.len());
             }
-        });
+        };
+        let jobs = bulk.len() + work.len();
+        // The card cannot see this upload until the caller executes the
+        // closed list after the workers join. One MiB of bulk gives the
+        // helpers useful work while the caller records. The up-copy probe
+        // inspects the source and keeps the original ordering.
+        if crate::asked_for!("VICTORY_SEND_RECORD_OVERLAP") && bulk_bytes >= layout::BULK_BYTES as u64 && !upcheck::on() {
+            let result = crate::land::each_under_while(jobs, &fill, || record(Some(&snapshot)));
+            STATS[4].fetch_add(1, Ordering::Relaxed);
+            STATS[3].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+            took();
+            return (Some(snapshot), result);
+        }
+        crate::land::each_under(jobs, &fill);
     } else {
         crate::land::each_under(work.len(), &one);
         crate::shadow::copy_all(moves);
     }
     STATS[3].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
-    Some(Own { memory, copies })
+    took();
+    let result = record(Some(&snapshot));
+    (Some(snapshot), result)
 }
 
 impl Own {

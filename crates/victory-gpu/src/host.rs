@@ -4048,11 +4048,12 @@ fn late_line(frames: f64) {
             let t: Vec<f64> = send::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
             tracing::info!(
                 "bytes of submissions' own sent up per frame (VICTORY_SEND_OWN): {:.1} MB in {:.0} runs, {:.0} words in scatters; {:.2} ms \
-                 taking them out of the CPU sides",
+                 taking them out of the CPU sides; {:.1} lists recorded during the snapshot",
                 t[0] / (1 << 20) as f64,
                 t[1],
                 t[2],
                 t[3] / 1000.0,
+                t[4],
             );
         }
         let t: Vec<f64> = torn::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
@@ -4726,12 +4727,10 @@ impl Host {
         let mut used: Vec<(bool, Prelude)> = Vec::new();
         let mut looks = None;
         // The bytes as they are now, whatever later submissions put there.
-        let taking = crate::timeline::span("copies in the card's memory: taken");
-        let began = std::time::Instant::now();
-        let own = if send::own() { send::take(self, &dirty) } else { None };
-        lean::card_part(lean::CardPart::Take, began);
-        taking.end();
-        if !dirty.is_empty() {
+        let (own, recorded) = send::take_and_record(self, &dirty, |own| -> windows::core::Result<Option<Prelude>> {
+            if dirty.is_empty() {
+                return Ok(None);
+            }
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
             };
@@ -4753,7 +4752,7 @@ impl Host {
                     // card do them one after the other.
                     let mut sent = Vec::new();
                     let mut transitioned = Vec::new();
-                    if let Some(own) = &own {
+                    if let Some(own) = own {
                         own.record(self, list, &dirty, |shadow| looks.as_ref().is_some_and(|l| l.hold(shadow)));
                     }
                     for (shadow, ranges) in &dirty {
@@ -4801,8 +4800,17 @@ impl Host {
                         list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
                         let joins = rehash_runs() || own.is_some();
-                        let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
-                            vec![shadow.card_run(0, usize::MAX)]
+                        let mut dispatches = 0;
+                        let mut pieces = 0;
+                        let mut record = |run: crate::shadow::CardSpan| {
+                            dispatches += 1;
+                            pieces += u64::from(run.pieces);
+                            card_pass(list, &run, size as u32, 0, 0);
+                        };
+                        if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
+                            record(shadow.card_run(0, usize::MAX));
+                        } else if joins && crate::asked_for!("VICTORY_CARD_HASH_BATCH") {
+                            compare_runs::rehash_sorted(ranges, |from, to| shadow.card_run(from, to), &mut record);
                         } else {
                             // (In order: the next of the same piece, of the
                             // tens of thousands there are, says nothing.)
@@ -4813,38 +4821,31 @@ impl Host {
                                     _ => runs.push(run),
                                 }
                             }
-                            runs
-                        };
-                        // The same pieces in fewer passes (`rehash_runs`).
-                        let runs = if joins { crate::shadow::joined_piece_runs(runs) } else { runs };
-                        CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
-                        CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
-                        for run in runs {
-                            card_pass(list, &run, size as u32, 0, 0);
+                            let runs = if joins { crate::shadow::joined_piece_runs(runs) } else { runs };
+                            runs.into_iter().for_each(&mut record);
                         }
+                        CARD_PASSES[0].fetch_add(dispatches, Ordering::Relaxed);
+                        CARD_PASSES[1].fetch_add(pieces, Ordering::Relaxed);
                     }
                     list.Close()?;
                     lean::card_part(lean::CardPart::RecordSync, recording);
-                    // The previous submission's lists may still be on the way
-                    // to the queue on the send thread (`VICTORY_SEND_THREAD`),
-                    // and this list must come after them, as it always did:
-                    // its bytes are newer than what they were prepared from.
-                    // Nothing else puts lists on the host queue between
-                    // submissions (the synchronous paths settle first, the
-                    // relay's fetch runs after its flight's fence completed).
-                    // This waits for the send thread only, and that thread
-                    // never takes `QUEUE_ORDER`, so holding it here cannot
-                    // deadlock.
-                    send_thread::wait_idle();
-                    let executing = std::time::Instant::now();
-                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
-                    lean::card_part(lean::CardPart::ExecuteSync, executing);
                     Ok(())
                 })()
             };
-            if let Err(e) = recorded {
-                fail(format_args!("host copies in the card's memory could not be brought up to date ({e})"));
-            }
+            recorded?;
+            Ok(Some(sync))
+        });
+        if let Some(sync) = recorded.unwrap_or_else(|e| fail(format_args!("host copies in the card's memory could not be brought up to date ({e})"))) {
+            // The workers have finished this submission's upload. The
+            // previous submission's lists must reach the queue before its
+            // successor's new bytes. The send worker never takes QUEUE_ORDER.
+            let list = sync.1.cast().unwrap_or_else(|e| fail(format_args!("no host interface for a card sync list ({e})")));
+            send_thread::wait_idle();
+            let executing = std::time::Instant::now();
+            // SAFETY: a closed list with live resources, its upload published
+            // by the join, and the queue ordering lock held when relaying.
+            unsafe { self.queue.ExecuteCommandLists(&[Some(list)]) };
+            lean::card_part(lean::CardPart::ExecuteSync, executing);
             used.push((false, sync));
         }
         drop(order);
@@ -8589,7 +8590,7 @@ mod wide_refresh_tests {
 /// once, it is checked again only after a step that writes title memory.
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    refreshes: Vec<crate::shadow::RefreshSpan>,
     /// Where each copy (by address) is in `refreshes`: the list that makes
     /// the heap's buffers ready adds some 4,100 copies, and searching them
     /// for every refresh of a submission was tens of millions of
@@ -9257,6 +9258,27 @@ impl Batch {
         }
     }
 
+    /// Remove clean ranges in place, keeping the order of all dirty ones.
+    fn retain_dirty(spans: &mut Vec<crate::shadow::RefreshSpan>, by: lean::Poll) {
+        use crate::shadow::REFRESH_GROUP;
+        if spans.len() < REFRESH_GROUP || !crate::shadow::batch_refreshes() {
+            spans.retain(|(copy, from, to)| !lean::polled(by, copy, *from, to - from));
+            return;
+        }
+        let mut kept = 0;
+        for first in (0..spans.len()).step_by(REFRESH_GROUP) {
+            let end = (first + REFRESH_GROUP).min(spans.len());
+            let clean = lean::polled_group(by, &spans[first..end]);
+            for i in first..end {
+                if clean & (1 << (i - first)) == 0 {
+                    spans.swap(kept, i);
+                    kept += 1;
+                }
+            }
+        }
+        spans.truncate(kept);
+    }
+
     /// Before the steps of `runs` ([`refresh_front`]), a new part of the
     /// submission beginning at each of `parts`.
     fn refresh_front(&mut self, runs: &[&HostList], parts: &[usize]) {
@@ -9321,7 +9343,7 @@ impl Batch {
         let many = spans.len() > FEW;
         if !many {
             let all = spans.len();
-            spans.retain(|(shadow, from, to)| !lean::polled(lean::Poll::Front, shadow, *from, *to - *from));
+            Self::retain_dirty(&mut spans, lean::Poll::Front);
             FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
         }
         let ahead = spans.len() > 1;
@@ -9341,7 +9363,7 @@ impl Batch {
                 return;
             };
             let (shadow, from, to) = &spans[i];
-            if many && lean::polled(lean::Poll::Front, shadow, *from, *to - *from) {
+            if many && lean::polled(lean::Poll::Front, shadow, *from, to - from) {
                 FLUSHES[2].fetch_add(1, Ordering::Relaxed);
                 return;
             }
@@ -9506,7 +9528,7 @@ impl Batch {
         if light && self.refreshes.len() <= FEW {
             let started = std::time::Instant::now();
             let all = self.refreshes.len();
-            self.refreshes.retain(|(shadow, from, to)| !lean::polled(lean::Poll::Barrier, shadow, *from, *to - *from));
+            Self::retain_dirty(&mut self.refreshes, lean::Poll::Barrier);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
         }

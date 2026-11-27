@@ -518,8 +518,17 @@ pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
     if stage() == 0 || !relay_exact() || !placed_order() || runs.len() < 2 {
         return None;
     }
-    // (Most submissions have none.)
-    let first = runs.iter().position(|l| l.deferred().copies.iter().any(|s| matches!(s, Step::Placed(_))))?;
+    // These recordings are closed and cannot be reset until the submission
+    // retires. A list without a placed copy cannot require this split.
+    // VICTORY_PLACED_SCAN=1 uses the bit already set by place_copy and
+    // cleared by reset, avoiding a lock and a walk over each list's steps.
+    static INDEXED: OnceLock<bool> = OnceLock::new();
+    let indexed = *INDEXED.get_or_init(|| std::env::var_os("VICTORY_PLACED_SCAN").is_some_and(|v| v == "1"));
+    let first = if indexed {
+        runs.iter().position(|l| l.has_placed.load(Ordering::Relaxed))
+    } else {
+        runs.iter().position(|l| l.deferred().copies.iter().any(|s| matches!(s, Step::Placed(_))))
+    }?;
     if first + 1 == runs.len() {
         return None;
     }

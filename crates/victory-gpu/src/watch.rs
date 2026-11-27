@@ -954,14 +954,32 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// asked: the submission's asking covers the range, or its blocks are known
 /// by their bits. `false` if something would have to be asked.
 pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64], ranged: u64, remember: Option<memo::CopyKey>) -> bool {
-    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     // The bits first, then the journal, as in `writes`.
     let known = published(start, end);
     #[cfg(feature = "diagnostics")]
     if known {
-        crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
+        crate::faultbook::note(crate::faultbook::What::Known, start / PAGE, end.div_ceil(PAGE), 1);
     }
-    let j = journal();
+    unchanged_in(&journal(), known, start, end, base, copied, ranged, remember)
+}
+
+/// A short read of CPU metadata for several adjacent refresh requests. No
+/// title, upload or card bytes move. A caller holding this guard must only
+/// try a shadow's locks and release the guard before updating any shadow.
+pub(crate) struct JournalRead(std::sync::RwLockReadGuard<'static, Journal>);
+
+pub(crate) fn read_journal() -> JournalRead {
+    JournalRead(journal())
+}
+
+impl JournalRead {
+    pub(crate) fn unchanged(&self, start: usize, end: usize, base: usize, copied: &[u64], ranged: u64) -> bool {
+        unchanged_in(&self.0, published(start, end), start, end, base, copied, ranged, None)
+    }
+}
+
+fn unchanged_in(j: &Journal, known: bool, start: usize, end: usize, base: usize, copied: &[u64], ranged: u64, remember: Option<memo::CopyKey>) -> bool {
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     if !known && !j.ahead.covers(first, last) {
         return false;
     }

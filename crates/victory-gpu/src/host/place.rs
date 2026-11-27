@@ -439,7 +439,9 @@ mod tests {
         crate::shadow::register(0x501a_ce01, base as u64, LEN as u64);
         let _shadow = crate::shadow::find(dst as u64, 512).expect("shadow for registered range");
         let list = host.new_list().unwrap();
+        assert!(!list.has_placed.load(super::Ordering::Relaxed));
         assert!(list.place_copy(dst, src, 512));
+        assert!(list.has_placed.load(super::Ordering::Relaxed));
         // Partial overlap or disjoint ranges must bail out cleanly.
         assert!(list.place_constant(dst - 16, 64).is_none());
         assert!(list.place_constant(dst + 480, 64).is_none());
@@ -465,6 +467,9 @@ mod tests {
         let got = unsafe { std::slice::from_raw_parts(out_ptr, 512) };
         let expected = unsafe { std::slice::from_raw_parts(src as *const u8, 512) };
         assert_eq!(got, expected);
+        list.reset();
+        assert!(!list.has_placed.load(super::Ordering::Relaxed));
+        assert!(!list.deferred().copies.iter().any(|s| matches!(s, super::Step::Placed(_))));
         crate::shadow::unregister(0x501a_ce01, base as u64);
         // SAFETY: `base` was allocated with `VirtualAlloc` and `list` has finished.
         unsafe {

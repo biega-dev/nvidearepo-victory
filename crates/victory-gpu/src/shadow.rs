@@ -1008,6 +1008,13 @@ pub(crate) struct CardSpan {
     pub(crate) skew: u32,
 }
 
+impl CardSpan {
+    /// First offset in the copy beyond the pieces the hash pass covers.
+    pub(crate) fn end_of_pieces(self) -> usize {
+        (self.first as usize + self.pieces as usize) * PIECE - self.skew as usize
+    }
+}
+
 /// [`CardSpan`] for offsets `[from, to)` (`from < to`) of a copy of title
 /// memory from `start` on.
 fn card_span_of(start: usize, from: usize, to: usize) -> CardSpan {
@@ -2498,6 +2505,51 @@ pub(crate) fn refresh_split() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_REFRESH_SPLIT").is_ok_and(|v| v == "1"))
 }
 
+/// VICTORY_REFRESH_BATCH=1 shares a journal read across the submitter's
+/// serial checks of independent host buffer copies. Let workers take heavy
+/// refreshes individually so one worker cannot inherit sixteen dirty ones.
+/// Keep per-call timers, the
+/// per-thread answer cache and fault recording on their original paths.
+fn batch_requested() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_REFRESH_BATCH"))
+}
+
+pub(crate) fn batch_refreshes() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if crate::faultbook::on() { return false; }
+    batch_requested() && !refresh_split() && !crate::watch::memo::enabled()
+}
+
+pub(crate) const REFRESH_GROUP: usize = u16::BITS as usize;
+pub(crate) type RefreshSpan = (Arc<Shadow>, usize, usize);
+
+/// Bits for current copies within one group. The shader will read
+/// the same upload or card copy. A dirty span goes through its normal update
+/// after this returns, with no journal or shadow lock carried into it.
+pub(crate) fn clean_mask(spans: &[RefreshSpan]) -> u16 {
+    assert!(spans.len() <= REFRESH_GROUP);
+    let mut clean = 0;
+    let mut retry = 0u16;
+    {
+        let journal = crate::watch::read_journal();
+        for (i, (copy, from, to)) in spans.iter().enumerate() {
+            match copy.try_unchanged(&journal, *from, to - from) {
+                Some(true) => clean |= 1 << i,
+                Some(false) => {}
+                None => retry |= 1 << i,
+            }
+        }
+    }
+    while retry != 0 {
+        let i = retry.trailing_zeros() as usize;
+        retry &= retry - 1;
+        let (copy, from, to) = &spans[i];
+        if copy.nothing_new_untimed(*from, to - from) { clean |= 1 << i; }
+    }
+    clean
+}
+
 /// Since the last line: [0] calls of `Shadow::nothing_new`, [1] nanoseconds in
 /// them (all threads together), [2] bytes copied of pages never taken before,
 /// [3] bytes copied of pages taken before and written since, [4] runs taken,
@@ -3485,6 +3537,32 @@ mod stale_tests {
     use super::*;
 
     #[test]
+    fn grouped_refresh_defers_a_busy_copy_before_waiting_for_it() {
+        let title = [0u8; 32];
+        let mut side = [0u8; 32];
+        let from = title.as_ptr() as usize;
+        let copy = Shadow::unbacked(from as u64, side.as_mut_ptr(), 32, false);
+        copy.watched.store(GUARDED, Ordering::Relaxed);
+        let (ready, held) = std::sync::mpsc::channel();
+        let (release, done) = std::sync::mpsc::channel();
+        std::thread::scope(|threads| {
+            let writing = copy.clone();
+            threads.spawn(move || {
+                let _pages = writing.copied.lock().unwrap();
+                ready.send(()).unwrap();
+                let _ = done.recv_timeout(std::time::Duration::from_secs(5));
+            });
+            held.recv().unwrap();
+            let journal = crate::watch::read_journal();
+            assert_eq!(copy.try_unchanged(&journal, from, 32), None);
+            drop(journal);
+            release.send(()).unwrap();
+        });
+        let spans = [(copy.clone(), from, from + 32)];
+        assert_eq!(clean_mask(&spans), u16::from(copy.nothing_new_untimed(from, 32)));
+    }
+
+    #[test]
     fn pages_never_taken_are_stale_written_or_not() {
         let base = 0x100;
         let copied = [5, 0, 5, 5];
@@ -3858,7 +3936,7 @@ impl Shadow {
         if pending.contains(&range) {
             return;
         }
-        if pending.is_empty() && crate::watch::memo::enabled() {
+        if pending.is_empty() && (crate::watch::memo::enabled() || batch_requested()) {
             self.pending_any.store(true, Ordering::Release);
         }
         self.forget_refresh();
@@ -4181,7 +4259,7 @@ impl Shadow {
         } else {
             pending.retain(|r| !ranges.contains(r));
         }
-        if pending.is_empty() && crate::watch::memo::enabled() {
+        if pending.is_empty() && (crate::watch::memo::enabled() || batch_requested()) {
             self.pending_any.store(false, Ordering::Release);
         }
         if !pending.is_empty() || self.card.is_some() {
@@ -4638,6 +4716,30 @@ impl Shadow {
             add(C::Unchanged, (to - from) as u64);
         }
         same
+    }
+
+    /// Try just the CPU metadata while the submitter holds the journal. A producer
+    /// can hold `copied` while asking the journal about partial writes. A busy
+    /// lock, pending GPU work, or a long walk is retried after the group.
+    fn try_unchanged(&self, journal: &crate::watch::JournalRead, address: usize, len: usize) -> Option<bool> {
+        if self.place.is_some() { return Some(true); }
+        let start = self.start as usize;
+        let from = address.max(start);
+        let to = address.saturating_add(len).min((self.start + self.len) as usize);
+        if from >= to { return Some(true); }
+        if !matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED) { return Some(false); }
+        if self.pending_any.load(Ordering::Acquire) || to.div_ceil(PAGE) - from / PAGE > 16 { return None; }
+        let copied = self.copied.try_lock().ok()?;
+        let ranged = self.ranged.try_lock().ok()?;
+        let taken = ranged.iter().filter(|r| r.0 <= from && to <= r.1).map(|r| r.2).max().unwrap_or(0);
+        let same = journal.unchanged(from, to, start / PAGE, &copied, taken);
+        #[cfg(feature = "diagnostics")]
+        if same {
+            use crate::copystat::{C, add};
+            add(C::Checked, (to - from) as u64);
+            add(C::Unchanged, (to - from) as u64);
+        }
+        Some(same)
     }
 
     fn forget_refresh(&self) {

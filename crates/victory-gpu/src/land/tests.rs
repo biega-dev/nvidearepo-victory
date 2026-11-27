@@ -2,6 +2,20 @@ use super::*;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize};
 use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE};
 
+#[test]
+fn an_error_recording_the_list_returns_after_every_snapshot_job() {
+    let pool = Pool::new("snapshot-test", 3);
+    let visits = [const { AtomicUsize::new(0) }; 16];
+    let result = pool.each_while(visits.len(), &|i| { visits[i].fetch_add(1, Ordering::Relaxed); }, || Err::<(), _>("close"));
+    assert_eq!(result, Err("close"));
+    assert!(visits.iter().all(|n| n.load(Ordering::Relaxed) == 1));
+    let panicked = std::panic::catch_unwind(|| pool.each_while(8, &|_| {}, || panic!("record")));
+    assert!(panicked.is_err());
+    let visits = AtomicUsize::new(0);
+    pool.each(8, &|_| { visits.fetch_add(1, Ordering::Relaxed); });
+    assert_eq!(visits.load(Ordering::Relaxed), 8);
+}
+
 struct Random(u64);
 
 impl Random {

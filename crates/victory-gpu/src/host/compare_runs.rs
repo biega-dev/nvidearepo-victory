@@ -33,6 +33,46 @@ pub(super) fn extend(run: &mut CardSpan, base: u32, next: CardSpan, slot: &mut u
     overlap
 }
 
+/// Record hash passes for the sorted, disjoint CPU-side ranges returned by
+/// `card_dirty`. The bytes have already been sent. The GPU hashes exactly the
+/// same pieces; the submitting thread can skip over short writes within one
+/// piece without building and sorting another list of offsets.
+pub(super) fn rehash_sorted(
+    mut ranges: &[(usize, usize)],
+    span: impl Fn(usize, usize) -> CardSpan,
+    mut record: impl FnMut(CardSpan),
+) {
+    let Some((&(first, last), rest)) = ranges.split_first() else { return };
+    let mut run = span(first, last);
+    ranges = rest;
+    while let Some((&(first, last), rest)) = ranges.split_first() {
+        let limit = run.end_of_pieces();
+        if last <= limit {
+            // Only search when several ranges fit. A sparse range costs one
+            // comparison and the number of ranges covered by a piece varies.
+            if ranges.get(3).is_some_and(|&(_, end)| end <= limit) {
+                let count = 4 + ranges[4..].partition_point(|&(_, end)| end <= limit);
+                run.to = ranges[count - 1].1 as u32;
+                ranges = &ranges[count..];
+            } else {
+                run.to = last as u32;
+                ranges = rest;
+            }
+            continue;
+        }
+        let next = span(first, last);
+        if next.first <= run.first + run.pieces {
+            run.pieces = (next.first - run.first + next.pieces).max(run.pieces);
+            run.to = next.to;
+        } else {
+            record(run);
+            run = next;
+        }
+        ranges = rest;
+    }
+    record(run);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -42,6 +82,56 @@ mod tests {
         let skew = 16;
         let first = (from + skew) / BLOCK;
         CardSpan { from, to, first, pieces: (to + skew).div_ceil(BLOCK) - first, skew }
+    }
+
+    #[test]
+    fn rehashing_sorted_offsets_records_the_same_dispatches() {
+        const BLOCK: usize = 1 << 16;
+        let mut sparse = 0;
+        let mut input = Vec::new();
+        for count in [0, 1, 2, 17, 8000] {
+            input.clear();
+            for n in 0..count {
+                sparse += if n % 91 == 0 { BLOCK * 4 } else { 8 };
+                let len = if n % 64 == 0 { BLOCK + 15 } else { 4 };
+                input.push((sparse, sparse + len));
+                sparse += len;
+            }
+            for skew in [0, 1, 16, BLOCK - 1] {
+                let span = |lo: usize, hi: usize| {
+                    let first = (lo + skew) / BLOCK;
+                    CardSpan { from: lo as u32, to: hi as u32, first: first as u32,
+                        pieces: ((hi + skew).div_ceil(BLOCK) - first) as u32, skew: skew as u32 }
+                };
+                let expected = crate::shadow::joined_piece_runs(input.iter().map(|&(a, b)| span(a, b)).collect());
+                let mut out = Vec::new();
+                rehash_sorted(&input, span, |r| out.push(r));
+                let commands = |spans: &[CardSpan]| spans.iter().map(|s| (s.first, s.pieces, s.skew)).collect::<Vec<_>>();
+                assert_eq!(commands(&out), commands(&expected));
+            }
+        }
+    }
+
+    #[test]
+    fn rehashing_near_the_end_of_a_four_gib_copy_respects_the_skew_and_clip() {
+        const BLOCK: usize = 1 << 16;
+        let end = u32::MAX as usize;
+        let ranges = [(end - 3 * BLOCK, end - 2 * BLOCK), (end - 4, end - 2), (end, end + 32)];
+        for size in [end - 2 * BLOCK, end, end + 1] {
+            for skew in [0, BLOCK - 1] {
+                let span = |lo: usize, hi: usize| {
+                    let hi = hi.min(size);
+                    let lo = lo.min(hi - 1);
+                    let first = (lo + skew) / BLOCK;
+                    CardSpan { from: lo as u32, to: hi as u32, first: first as u32,
+                        pieces: ((hi + skew).div_ceil(BLOCK) - first) as u32, skew: skew as u32 }
+                };
+                let expected = crate::shadow::joined_piece_runs(ranges.iter().map(|&(a, b)| span(a, b)).collect());
+                let mut out = Vec::new();
+                rehash_sorted(&ranges, span, |r| out.push((r.first, r.pieces, r.skew)));
+                assert_eq!(out, expected.iter().map(|r| (r.first, r.pieces, r.skew)).collect::<Vec<_>>());
+            }
+        }
     }
 
     #[test]

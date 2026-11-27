@@ -1320,7 +1320,21 @@ impl Memory {
             note_landed(&self.directory.1, entry, entry + 8);
             LANDED_BYTES[0].fetch_add(8, std::sync::atomic::Ordering::Relaxed);
         }
+        // Sample before reading the title page. Writes racing that read must
+        // still be newer than the stamp. Only a watched page gets a stamp:
+        // an unknown mapping keeps the ordinary first full refresh.
+        let taken = if place_taken() {
+            crate::watch::writes((page * PAGE) as usize, ((page + 1) * PAGE) as usize, false)
+                .map(|(stamp, _)| stamp)
+        } else {
+            None
+        };
         self.take(page, 0, PAGE as usize, true);
+        if let Some(taken) = taken {
+            // The arena already has the title's full page for the GPU.
+            // Its next bring only has to consider subsequent title writes.
+            self.pages.get_mut(&page).expect("just placed").taken = taken;
+        }
         true
     }
 
@@ -2182,6 +2196,13 @@ fn merge(title: &[u8; PIECE], ours: &mut [u8], never: bool) -> usize {
     changed
 }
 
+/// With `VICTORY_PLACE_TAKEN=1`, remember the write-watch stamp of the first
+/// full upload of a placed page. Off keeps the original refresh.
+fn place_taken() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLACE_TAKEN").is_some_and(|v| v == "1"))
+}
+
 /// The lines of [`Memory::report`], written when this goes out of scope.
 struct Said(Vec<String>);
 
@@ -2699,6 +2720,39 @@ mod dump {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "needs D3D12 and a write-watched page"]
+    fn first_placed_page_is_only_refreshed_after_a_new_write() {
+        let bytes = PAGE as usize;
+        let title = crate::upload::reserve(bytes).expect("title page");
+        let page = title as u64 / PAGE;
+        let mut memory = Memory::new().expect("D3D12 memory directory");
+        memory.frame = 1;
+        assert!(memory.another());
+        // SAFETY: the test owns the whole committed page through the last bring.
+        unsafe { (title as *mut u32).write(17) };
+        assert!(memory.place(page));
+        let arena = memory.pages[&page].at as *mut u32;
+        // SAFETY: the independent arena page is live and this test owns Memory.
+        unsafe {
+            assert_eq!(arena.read(), 17);
+            arena.write(29);
+        }
+        memory.frame += 1;
+        memory.bring(page, page + 1);
+        // SAFETY: both mappings are live. The synthetic builder's word must
+        // survive a refresh with no title writes when the stamp is enabled.
+        unsafe {
+            assert_eq!(arena.read(), if place_taken() { 29 } else { 17 });
+            (title as *mut u32).write(41);
+        }
+        memory.frame += 1;
+        memory.bring(page, page + 1);
+        // SAFETY: the same arena page now has the title's newer write.
+        assert_eq!(unsafe { arena.read() }, 41);
+        crate::upload::release(title);
+    }
 
     /// A call is quiet only when its list used every key the long way gives
     /// it: both constant forms (the second only when it builds), the view,

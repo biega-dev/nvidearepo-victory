@@ -277,9 +277,15 @@ impl Pool {
     /// Calls `f` with every number below `count`, on the pool's threads and
     /// this one, and returns when every call has.
     fn each(&self, count: usize, f: &(dyn Fn(usize) + Sync)) {
+        self.each_while(count, f, || ());
+    }
+
+    /// The caller does its independent work first, then helps with any
+    /// remaining numbers. A returned error or panic still joins all helpers.
+    fn each_while<R>(&self, count: usize, f: &(dyn Fn(usize) + Sync), on_caller: impl FnOnce() -> R) -> R {
         if count < 2 || self.threads < 2 {
             (0..count).for_each(f);
-            return;
+            return on_caller();
         }
         let _spread = crate::timeline::span("landing: spread over threads");
         let _turn = self.turn.lock().unwrap_or_else(|e| e.into_inner());
@@ -295,10 +301,12 @@ impl Pool {
             (1..count).for_each(|_| self.more.notify_one());
         }
         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let result = on_caller();
             loop {
                 let Some((_, i)) = take(&mut self.state()) else { break };
                 f(i);
             }
+            result
         }));
         let mut state = self.state();
         // (After a panic here: nothing more is begun.)
@@ -308,10 +316,9 @@ impl Pool {
         }
         let panicked = state.panicked;
         drop(state);
-        if let Err(panic) = ran {
-            std::panic::resume_unwind(panic);
-        }
+        let result = ran.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
         assert!(!panicked, "a job of landing panicked");
+        result
     }
 }
 
@@ -334,12 +341,18 @@ pub(crate) fn each(count: usize, f: &(dyn Fn(usize) + Sync)) {
 /// [`Pool::each`] on threads kept for the title's bytes under flights' writes
 /// (`VICTORY_UNDER_THREADS`, 6 with this one).
 pub(crate) fn each_under(count: usize, f: &(dyn Fn(usize) + Sync)) {
+    each_under_while(count, f, || ());
+}
+
+/// Use the same workers as `each_under` while the caller records a host
+/// list. The caller must not submit it, or re-enter this pool, in `record`.
+pub(crate) fn each_under_while<R>(count: usize, f: &(dyn Fn(usize) + Sync), record: impl FnOnce() -> R) -> R {
     static POOL: OnceLock<&'static Pool> = OnceLock::new();
     POOL.get_or_init(|| {
         let threads = std::env::var("VICTORY_UNDER_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(6usize);
         Pool::new("victory-under", threads.clamp(1, 16))
     })
-    .each(count, f);
+    .each_while(count, f, record)
 }
 
 /// Calls `f` with every number below `count`, on this thread and on threads

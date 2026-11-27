@@ -46,8 +46,11 @@ param(
     [switch]$RyzenPreparo,
     # Ryzen command preparation plus GPU texture detiling for eligible uploads.
     [switch]$RyzenTexturas,
+    # Experiment on the 3700X: group checks of unchanged buffers and plan card rehashes in order.
+    [switch]$RyzenCopias,
     [hashtable]$More = @{}
 )
+if ($RyzenCopias) { $RyzenTexturas = $true }
 if ($RyzenTexturas) { $RyzenPreparo = $true }
 if ($RyzenPreparo) { $Ryzen3700X = $true }
 $repo = Split-Path $PSScriptRoot -Parent
@@ -154,6 +157,13 @@ if ($RyzenTexturas) {
     $settings.VICTORY_REFRESH_SPLIT = '0'
     $settings.VICTORY_GPU_DETILE = '1'
 }
+if ($RyzenCopias) {
+    $settings.VICTORY_REFRESH_BATCH = '1'
+    $settings.VICTORY_CARD_HASH_BATCH = '1'
+    $settings.VICTORY_SEND_RECORD_OVERLAP = '1'
+    $settings.VICTORY_PLACED_SCAN = '1'
+    $settings.VICTORY_PLACE_TAKEN = '1'
+}
 if (-not $SeriesS) {
     if ($Res -eq '1440') { $settings.VICTORY_NATIVE_1440P = '1' }
     elseif ($Res -eq '1080to1440') { $settings.VICTORY_RENDER_1080P = '1' }
@@ -196,7 +206,7 @@ $settings.VICTORY_MENU_FRAMEGEN = if ($settings.VICTORY_FRAMEGEN -eq '1') { [str
 $settings.VICTORY_MENU_FPS = [string]$fpsWanted
 $settings.VICTORY_MENU_FILE = $menuFile
 $settings.VICTORY_MENU_PLAY = $MyInvocation.MyCommand.Path
-$ryzenArg = if ($RyzenTexturas) { ' -RyzenTexturas' } elseif ($RyzenPreparo) { ' -RyzenPreparo' } elseif ($Ryzen3700X) { ' -Ryzen3700X' }
+$ryzenArg = if ($RyzenCopias) { ' -RyzenCopias' } elseif ($RyzenTexturas) { ' -RyzenTexturas' } elseif ($RyzenPreparo) { ' -RyzenPreparo' } elseif ($Ryzen3700X) { ' -Ryzen3700X' }
 $settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($NoFrameGenReady) { ' -NoFrameGenReady' })$(if ($Fast) { ' -Fast' })$ryzenArg"
 
 $victory = Join-Path $repo "target\$Build\victory.exe"
