@@ -46,8 +46,11 @@ param(
     [switch]$RyzenPreparo,
     # Ryzen command preparation plus GPU texture detiling for eligible uploads.
     [switch]$RyzenTexturas,
+    # Batch light refreshes on Ryzen and track concurrent write-watch requests by range.
+    [switch]$RyzenLotes,
     [hashtable]$More = @{}
 )
+if ($RyzenLotes) { $RyzenTexturas = $true }
 if ($RyzenTexturas) { $RyzenPreparo = $true }
 if ($RyzenPreparo) { $Ryzen3700X = $true }
 $repo = Split-Path $PSScriptRoot -Parent
@@ -154,6 +157,13 @@ if ($RyzenTexturas) {
     $settings.VICTORY_REFRESH_SPLIT = '0'
     $settings.VICTORY_GPU_DETILE = '1'
 }
+if ($RyzenLotes) {
+    $settings.VICTORY_WIDE_CHUNK = '4'
+    $settings.VICTORY_REFRESH_AVX2 = '1'
+    $settings.VICTORY_WATCH_SPANS = '1'
+    # The optional F1 texture setting only affects levels at least this large.
+    $settings.VICTORY_TEXTURE_SKIP_MIN = '2048'
+}
 if (-not $SeriesS) {
     if ($Res -eq '1440') { $settings.VICTORY_NATIVE_1440P = '1' }
     elseif ($Res -eq '1080to1440') { $settings.VICTORY_RENDER_1080P = '1' }
@@ -196,7 +206,7 @@ $settings.VICTORY_MENU_FRAMEGEN = if ($settings.VICTORY_FRAMEGEN -eq '1') { [str
 $settings.VICTORY_MENU_FPS = [string]$fpsWanted
 $settings.VICTORY_MENU_FILE = $menuFile
 $settings.VICTORY_MENU_PLAY = $MyInvocation.MyCommand.Path
-$ryzenArg = if ($RyzenTexturas) { ' -RyzenTexturas' } elseif ($RyzenPreparo) { ' -RyzenPreparo' } elseif ($Ryzen3700X) { ' -Ryzen3700X' }
+$ryzenArg = if ($RyzenLotes) { ' -RyzenLotes' } elseif ($RyzenTexturas) { ' -RyzenTexturas' } elseif ($RyzenPreparo) { ' -RyzenPreparo' } elseif ($Ryzen3700X) { ' -Ryzen3700X' }
 $settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($NoFrameGenReady) { ' -NoFrameGenReady' })$(if ($Fast) { ' -Fast' })$ryzenArg"
 
 $victory = Join-Path $repo "target\$Build\victory.exe"

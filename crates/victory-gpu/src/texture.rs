@@ -907,8 +907,9 @@ pub(crate) fn upload(list: &HostList, resource: This, _texture: &ID3D12Resource)
 thread_local! {
     /// The thread records uploads for a draw that bakes from them.
     pub(crate) static BAKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// The thread records the upload of a texture picked by index, of which
-    /// that many bytes were found mapped just now (`u64::MAX`: not asked).
+    /// The thread records an upload for a texture picked by index. A finite
+    /// value is the length of a wholly mapped view; partial or unknown views
+    /// use `u64::MAX` so the staging buffer checks its own range.
     pub(crate) static PICKING: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
@@ -1087,13 +1088,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     // the list is submitted, after the check that refreshes the staging
     // buffer, and the copy goes on the list's prelude ([`PreludeUpload`]).
     if conditional {
-        if no_wait() && fill_unlocked() {
-            let there = match picking {
-                Some(there) if there != u64::MAX => there,
-                _ => mapped_bytes(staging.memory, staging.read),
-            };
-            staging.expected.store(there, Relaxed);
-        }
+        staging.expect_mapped(picking.unwrap_or(u64::MAX));
         let on_demand = if staging.on_demand { crate::resource::host_tiled(resource) } else { None };
         list.defer_prelude_upload(PreludeUpload { staging, copy, on_demand, resource: resource as usize, card: None });
         return;
@@ -1112,13 +1107,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::TexUploads, 1);
-    if no_wait() && fill_unlocked() {
-        let there = match picking {
-            Some(there) if there != u64::MAX => there,
-            _ => mapped_bytes(staging.memory, staging.read),
-        };
-        staging.expected.store(there, Relaxed);
-    }
+    staging.expect_mapped(picking.unwrap_or(u64::MAX));
     // (Recorded before the check that detiles it: its zeros now, if it was
     // handed out without them.)
     staging.zero_if_unwritten();
@@ -1651,6 +1640,12 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
 }
 
 impl Staging {
+    fn expect_mapped(&self, whole_view: u64) {
+        if no_wait() && fill_unlocked() {
+            self.expected.store(expected_mapped(self.memory, self.read, whole_view), Relaxed);
+        }
+    }
+
     /// Levels on demand: what says, beside the mapping, which levels of
     /// the texture are the title's now. First the lowest level a live view
     /// of the texture shows (0 without a view that says): the title's own
@@ -2443,6 +2438,17 @@ pub(crate) fn staged(resource: This, ask: bool) -> Option<(u64, bool)> {
     Some((s.read as u64, whole))
 }
 
+/// Bytes an upload expects to read from title memory at `at`. Smaller mips
+/// occupy the prefix of the view. Only a wholly mapped view covering that
+/// prefix can supply the staging count without another mapping query.
+fn expected_mapped(at: *const u8, read: usize, whole_view: u64) -> u64 {
+    if whole_view != u64::MAX && whole_view >= read as u64 {
+        read as u64
+    } else {
+        mapped_bytes(at, read)
+    }
+}
+
 /// Whether all of `[at, at + len)` is mapped: by the runtime's views of
 /// physical pages where any lies there (as [`mapped_bytes`] asks), else by
 /// asking Windows ([`committed`]).
@@ -2881,6 +2887,33 @@ mod title_memory_tests {
         crate::inplace::views_gone(at, 4 * BLOCK);
         // SAFETY: our reservation, released whole.
         unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn expected_upload_bytes_cover_only_the_staged_mip_range() {
+        use windows_sys::Win32::System::Memory::*;
+        const BLOCK: usize = 64 << 10;
+        let view = 4 * BLOCK;
+        let retained = 2 * BLOCK;
+        // SAFETY: the test owns the reservation and changes only its own pages.
+        unsafe {
+            let at = VirtualAlloc(std::ptr::null(), view, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE).cast::<u8>();
+            assert!(!at.is_null());
+            at.write_bytes(1, view);
+            let mapped = super::mapped_bytes(at, view);
+            assert_eq!(mapped, view as u64);
+            assert_eq!(super::expected_mapped(at, retained, mapped), retained as u64);
+
+            // Only one of the two retained blocks is present. The skipped
+            // levels are mapped, so the whole view contains three blocks.
+            assert_ne!(VirtualFree(at.add(BLOCK).cast(), BLOCK, MEM_DECOMMIT), 0);
+            assert_eq!(super::mapped_bytes(at, view), (3 * BLOCK) as u64);
+            assert_eq!(super::expected_mapped(at, retained, u64::MAX), BLOCK as u64);
+            // A known smaller view also requires checking the wider staging
+            // buffer, which reaches one more mapped block past the hole.
+            assert_eq!(super::expected_mapped(at, 3 * BLOCK, BLOCK as u64), (2 * BLOCK) as u64);
+            assert_ne!(VirtualFree(at.cast(), 0, MEM_RELEASE), 0);
+        }
     }
 
     /// Title memory whose tail is reserved and not committed reads through

@@ -228,8 +228,9 @@ pub(super) enum Does {
     Read { from: usize, to: usize, asked: bool },
     /// A refresh of a host copy (named by its address).
     Refresh { shadow: usize, from: usize, to: usize },
-    /// A copy that its list does on the card ([`place`]).
-    Placed { dst: usize, src: usize, len: usize },
+    /// A placed copy may take its source from upload scratch that the CPU
+    /// can fill only after an earlier GPU writer has landed.
+    Placed { dst: usize, src: usize, len: usize, cpu_source_wait: bool },
     /// Anything, anywhere.
     Run,
 }
@@ -278,6 +279,7 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
     for (i, d) in does.iter().enumerate() {
         match *d {
             Does::Run => return Err("a step of ours runs"),
+            Does::Placed { cpu_source_wait: true, .. } => return Err("a placed copy's CPU source is still being written"),
             Does::Read { asked: true, .. } => return Err("a texture reads it"),
             Does::Copy { asked: true, .. } | Does::Fill { asked: true, .. } => more.push(i),
             _ => {}
@@ -321,7 +323,7 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
     // of them: as it should after the steps ahead of it, but not after those
     // behind it that read or write its bytes.
     for (p, d) in does.iter().enumerate() {
-        if let Does::Placed { dst, src, len } = *d
+        if let Does::Placed { dst, src, len, .. } = *d
             && (touched(&read, (dst, dst + len)) || touched(&written, (dst, dst + len)) || touched(&written, (src, src + len)))
         {
             let (to, from) = ((dst, dst + len), (src, src + len));
@@ -480,7 +482,12 @@ pub(super) fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Do
                     to: *at + *len,
                 },
                 Step::Run(_) => Does::Run,
-                Step::Placed(p) => Does::Placed { dst: p.dst, src: p.src, len: p.len },
+                Step::Placed(p) => Does::Placed {
+                    dst: p.dst,
+                    src: p.src,
+                    len: p.len,
+                    cpu_source_wait: matches!(p.waits(written), place::Waits::Yes),
+                },
                 Step::RefreshSet(_) | Step::GpuWrite(..) | Step::Host(..) => continue,
             });
             steps.push((std::ptr::from_ref::<HostList>(list) as usize, i));
@@ -669,10 +676,11 @@ static DONE: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::Ato
 /// line says what keeps the card from taking the steps (a test keeps this
 /// list and the places that refuse in step). The last place of [`WHY`] is
 /// for a reason that is not listed.
-const REASONS: [&str; 20] = [
+const REASONS: [&str; 21] = [
     "a buffer copy (VICTORY_CARD_STEPS=2 does it on the card)",
     "a fill of memory the card cannot be given the bytes of",
     "a step of ours runs",
+    "a placed copy's CPU source is still being written",
     "a texture reads it",
     "a copy onto itself",
     "too many steps depend on it",
@@ -1075,6 +1083,17 @@ mod tests {
         plan(does, 2, true, &mut None).unwrap()
     }
 
+    #[test]
+    fn placed_upload_waits_for_the_cpu_source_before_forwarding() {
+        let fill = Does::Fill { src: 2000, len: 64, asked: true, to: true };
+        let placed = |cpu_source_wait| Does::Placed { dst: 2000, src: 3000, len: 64, cpu_source_wait };
+        for by_order in [true, false] {
+            assert!(plan(&[fill, placed(true)], 2, by_order, &mut None).is_err());
+        }
+        assert_eq!(plan(&[fill, placed(false)], 2, true, &mut None), Ok(vec![(0, 0)]));
+        assert_eq!(plan(&[placed(false), fill], 2, true, &mut None), Err(BEHIND_PLACED));
+    }
+
     /// Only what is asked for is taken, all of it, and a step that stands
     /// in none of their ways stays where it is.
     /// Every reason this file refuses with has a place in [`REASONS`], and
@@ -1165,7 +1184,7 @@ mod tests {
     /// bytes behind it, not of what did ahead of it.
     #[test]
     fn copies_at_their_place_stand_in_the_way_of_what_is_behind_them() {
-        let placed = Does::Placed { dst: 2000, src: 3000, len: 64 };
+        let placed = Does::Placed { dst: 2000, src: 3000, len: 64, cpu_source_wait: false };
         let behind = |does: &[Does]| {
             let mut found = None;
             let refused = plan(does, 2, true, &mut found);

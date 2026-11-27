@@ -9324,7 +9324,9 @@ impl Batch {
             spans.retain(|(shadow, from, to)| !lean::polled(lean::Poll::Front, shadow, *from, *to - *from));
             FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
         }
-        let ahead = spans.len() > 1;
+        // The standing query already covers this submission. Building the
+        // per-flush list would walk thousands of copies only to discard it.
+        let ahead = spans.len() > 1 && !crate::watch::asking_stands();
         if ahead {
             let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
             crate::watch::ask_ahead(&ranges);
@@ -9334,7 +9336,7 @@ impl Batch {
         // VICTORY_REFRESH_PROBE_TEXTURES): tried here first ([`lean::spread`]).
         // taken before the closure moves `due`.
         let small = !many && (due.is_empty() || lean::textures_small(&due, spans.len()));
-        lean::spread(spans.len() + due.len(), small, move |i| {
+        lean::spread(spans.len() + due.len(), small, Some(due.len()), move |i| {
             // The textures first: they are the longer pieces.
             let Some(i) = i.checked_sub(due.len()) else {
                 due[i].refresh();
@@ -9352,7 +9354,7 @@ impl Batch {
         }
         // The time counted is the time it took, not the threads' sum.
         let took = started.elapsed().as_micros() as u64;
-        let summed = [0, 2].map(|i| PREPARING[i].load(Ordering::Relaxed)).iter().zip(before).map(|(now, was)| now.saturating_sub(was)).collect::<Vec<_>>();
+        let summed = [0, 1].map(|slot| PREPARING[2 * slot].load(Ordering::Relaxed).saturating_sub(before[slot]));
         PREPARING[2].fetch_sub(summed[1], Ordering::Relaxed);
         PREPARING[0].fetch_sub(summed[0], Ordering::Relaxed);
         PREPARING[0].fetch_add(took, Ordering::Relaxed);
@@ -9391,7 +9393,7 @@ impl Batch {
         let started = std::time::Instant::now();
         let before = PREPARING[0].load(Ordering::Relaxed);
         let small = due.len() <= 256;
-        lean::spread(due.len(), small, move |i| {
+        lean::spread(due.len(), small, None, move |i| {
             let (shadow, from, to) = &due[i];
             if !lean::polled(lean::Poll::Ahead, shadow, *from, *to - *from) {
                 Self::update(shadow, *from, *to);
@@ -9512,7 +9514,7 @@ impl Batch {
         }
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
-        let ahead = self.refreshes.len() > 1;
+        let ahead = self.refreshes.len() > 1 && !crate::watch::asking_stands();
         if ahead {
             let started = std::time::Instant::now();
             let ranges: Vec<(usize, usize)> = self
@@ -9536,7 +9538,7 @@ impl Batch {
                 let refreshes = std::mem::take(&mut self.refreshes);
                 // Up to FEW copies (the retain above has run): tried here
                 // first ([`lean::spread`]); the heap's thousands are not.
-                lean::spread(refreshes.len(), refreshes.len() <= FEW, move |i| {
+                lean::spread(refreshes.len(), refreshes.len() <= FEW, Some(0), move |i| {
                     let (shadow, from, to) = &refreshes[i];
                     if refreshes.len() > FEW && lean::polled(lean::Poll::Barrier, shadow, *from, *to - *from) {
                         FLUSHES[2].fetch_add(1, Ordering::Relaxed);

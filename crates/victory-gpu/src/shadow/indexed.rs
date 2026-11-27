@@ -21,12 +21,9 @@ struct State {
 }
 
 impl<F: Fn(usize)> Batch<F> {
-    pub(super) fn new(count: usize, threads: usize, work: F) -> Self {
+    pub(super) fn new(count: usize, chunk: usize, work: F) -> Self {
         Self {
-            work, count, next: AtomicUsize::new(0),
-            // A few adjacent page checks per claim on a large heap. Keep small
-            // batches divisible among helpers even if the last copy is slow.
-            chunk: (count / threads.max(1) / 32).clamp(1, 8),
+            work, count, chunk, next: AtomicUsize::new(0),
             state: Mutex::new(State::default()), done: Condvar::new(),
         }
     }

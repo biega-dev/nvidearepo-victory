@@ -2721,11 +2721,18 @@ extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u
     // as they did), not the placeholder the host has.
     materialize_for(address as usize, size, Touch::TitleCall);
     // Splitting and joining placeholders changes nothing they show.
-    if kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0 {
-        victory_gpu::title_memory_freed(address as usize, size);
-    }
+    let freeing = (kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0)
+        .then(|| victory_gpu::title_memory_freed(address as usize, size));
     // SAFETY: the title's own arguments.
-    unsafe { VirtualFree(address, size, kind) }
+    let result = unsafe { VirtualFree(address, size, kind) };
+    // SAFETY: read this thread's error before notifying the watch of completion.
+    let error = (result == 0).then(|| unsafe { windows_sys::Win32::Foundation::GetLastError() });
+    drop(freeing);
+    if let Some(error) = error {
+        // SAFETY: restore the failed VirtualFree's error to this thread.
+        unsafe { windows_sys::Win32::Foundation::SetLastError(error) };
+    }
+    result
 }
 
 /// The title's own `VirtualQuery`, while views are kept in the books alone
@@ -2804,6 +2811,28 @@ mod tests {
         let p = XMemAlloc(4096, ALLOC_32BIT);
         assert!(!p.is_null() && (p as usize) < 1 << 32);
         XMemFree(p, ALLOC_32BIT);
+    }
+
+    #[test]
+    fn title_virtual_free_preserves_the_kernel_error_and_releases_its_reservation() {
+        use windows_sys::Win32::Foundation::GetLastError;
+        use windows_sys::Win32::System::Memory::MEM_DECOMMIT;
+        // SAFETY: a private reservation of ours, released below.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!p.is_null());
+        // SAFETY: MEM_RELEASE with a nonzero length is rejected. Read its
+        // error on this thread, before making any other Windows call.
+        let (failed, expected) = unsafe {
+            let result = VirtualFree(p, PAGE, MEM_RELEASE);
+            (result, GetLastError())
+        };
+        assert_eq!(failed, 0);
+        let result = title_virtual_free(p, PAGE, MEM_RELEASE);
+        // SAFETY: read the title import's error on this thread.
+        let error = unsafe { GetLastError() };
+        assert_eq!((result, error), (0, expected));
+        assert_ne!(title_virtual_free(p, PAGE, MEM_DECOMMIT), 0);
+        assert_ne!(title_virtual_free(p, 0, MEM_RELEASE), 0);
     }
 
     #[test]

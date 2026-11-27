@@ -3390,7 +3390,7 @@ impl HostHeap {
                 // view's description, after format, dimension, mapping
                 // and a pad.)
                 let at = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-                let held = crate::resource::placed_bytes_from(resource, crate::resource::first_mip(desc));
+                let held = crate::resource::placed_bytes_from(resource, crate::resource::first_mip(resource, desc));
                 Some((resource, at, desc[4], held.map_or(u64::MAX, |held| at.saturating_add(held))))
             }
             _ => None,
@@ -5143,17 +5143,27 @@ fn make_twinned(
 /// on (`crate::resource::held_only`). What it shows of larger ones, if any,
 /// is left out.
 fn from_base(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, base: u32) {
-    if desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D {
-        return;
+    // A single-slice 2D resource can also be viewed as a 2D array.
+    // SAFETY: each branch takes the member its view dimension names.
+    let (first, levels, clamp) = unsafe {
+        match desc.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE2D => {
+                let t = &mut desc.Anonymous.Texture2D;
+                (&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp)
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+                let t = &mut desc.Anonymous.Texture2DArray;
+                (&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp)
+            }
+            _ => return,
+        }
+    };
+    let lost = base.saturating_sub(*first);
+    *first = first.saturating_sub(base);
+    if *levels != u32::MAX {
+        *levels = levels.saturating_sub(lost).max(1);
     }
-    // SAFETY: the member its dimension says.
-    let t = unsafe { &mut desc.Anonymous.Texture2D };
-    let lost = base.saturating_sub(t.MostDetailedMip);
-    t.MostDetailedMip = t.MostDetailedMip.saturating_sub(base);
-    if t.MipLevels != u32::MAX {
-        t.MipLevels = t.MipLevels.saturating_sub(lost).max(1);
-    }
-    t.ResourceMinLODClamp = (t.ResourceMinLODClamp - base as f32).max(0.0);
+    *clamp = (*clamp - base as f32).max(0.0);
 }
 
 /// Writes of a slot with another view of the placed texture it showed,
@@ -5483,7 +5493,7 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
     let texture = crate::resource::texture_at(address, resource)?;
-    crate::resource::want_level(texture, crate::resource::first_mip(desc));
+    crate::resource::want_level(texture, crate::resource::first_mip(resource, desc));
     Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
 }
 
@@ -5786,6 +5796,16 @@ mod tests {
         assert_eq!(view(5, u32::MAX, 5.5), (2, u32::MAX, 2.5));
         // (Two levels the copy has not.)
         assert_eq!(view(1, 4, 0.0), (0, 2, 0.0));
+        // A view entirely above the first retained level samples that level.
+        assert_eq!(view(0, 1, 0.0), (0, 1, 0.0));
+        // An array view of the same resource keeps its slice and plane.
+        let mut array = srv_desc(&[98, 5, 5768, 0, 1, 4, 0, 1, 0, 4.5_f32.to_bits()]);
+        from_base(&mut array, 3);
+        // SAFETY: the dimension in the words above is TEXTURE2DARRAY.
+        let t = unsafe { array.Anonymous.Texture2DArray };
+        assert_eq!((t.MostDetailedMip, t.MipLevels, t.ResourceMinLODClamp), (0, 2, 1.5));
+        assert_eq!((t.FirstArraySlice, t.ArraySize, t.PlaneSlice), (0, 1, 0));
+        assert_eq!(array.ViewDimension, D3D12_SRV_DIMENSION_TEXTURE2DARRAY);
     }
 
     /// 2D textures and arrays have a neutral stand-in, others a null view.

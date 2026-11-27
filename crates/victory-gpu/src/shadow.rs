@@ -24,6 +24,19 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
+/// The page and partial-range stamps describe the same host copy. The
+/// submission workers consult both under one lock before moving any bytes.
+struct Copied {
+    pages: Vec<u64>,
+    ranges: [(usize, usize, u64); 2],
+}
+
+impl Copied {
+    fn ranged(&self, from: usize, to: usize) -> u64 {
+        self.ranges.iter().filter(|r| r.0 <= from && to <= r.1).map(|r| r.2).max().unwrap_or(0)
+    }
+}
+
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
     /// Title memory's pages of 4 KiB (from the one `start` lies in on), a bit
@@ -42,12 +55,8 @@ pub(crate) struct Shadow {
     len: u64,
     /// Per page of title memory from `start`'s on: the write-watch asking
     /// after which it was last copied (0: never).
-    copied: Mutex<Vec<u64>>,
-    /// Two ranges of title memory taken whole, the last one and the longest,
-    /// and the asking after which each was ([`Shadow::copy_stale`]). A page
-    /// a range holds in part cannot say so in `copied`. Locked inside
-    /// `copied`'s lock.
-    ranged: Mutex<[(usize, usize, u64); 2]>,
+    /// Also holds the last and the longest partial range copied whole.
+    copied: Mutex<Copied>,
     /// Changes before pending ranges or per-copy freshness notes are edited
     /// under their locks. A worker's earlier positive answer then expires.
     refresh_revision: AtomicU64,
@@ -799,7 +808,7 @@ pub(crate) fn stale_pages(most: usize, say: &mut dyn FnMut(&Shadow, usize, usize
             continue;
         };
         let written: std::collections::HashMap<usize, u64> = written.into_iter().collect();
-        let copied = shadow.copied.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let copied = shadow.copied.lock().unwrap_or_else(|e| e.into_inner()).pages.clone();
         for (i, &at) in copied.iter().enumerate() {
             let page = start / PAGE + i;
             if at == 0 || written.get(&page).is_some_and(|&w| w > at) {
@@ -1709,7 +1718,9 @@ fn spin(there: impl Fn() -> bool) {
 
 /// How many threads are kept for [`wide`].
 fn wide_threads() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
+    // The pool is made once. Use its original size for the later wakes too.
+    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *THREADS.get_or_init(|| std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6))
 }
 
 fn workers() -> &'static Workers {
@@ -1844,17 +1855,77 @@ pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
 /// this one, the next number to whichever is free: for thousands of small
 /// pieces of work, where a job each ([`wide`]) is mostly the jobs' queue.
 pub(crate) fn wide_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) {
+    wide_shares(n, n >= 4 && local_refresh_work(), false, work);
+}
+
+fn local_refresh_work() -> bool {
+    crate::asked_for!("VICTORY_REFRESH_LOCAL_WORK")
+}
+
+/// VICTORY_WIDE_CHUNK caps adjacent copy refreshes per claim (1 by
+/// default). Leading textures cost more and keep one claim each.
+fn wide_chunk() -> usize {
+    static CHUNK: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CHUNK.get_or_init(|| {
+        std::env::var("VICTORY_WIDE_CHUNK").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(1).clamp(1, 256)
+    })
+}
+
+/// Group the lightweight suffix on the kept threads. The same refresh reads
+/// title memory and updates its host copy once; the grouping moves no bytes.
+pub(crate) fn wide_each_from(n: usize, single: Option<usize>, work: impl Fn(usize) + Send + Sync + 'static) {
+    let Some(single) = single else { return wide_each(n, work) };
+    let limit = wide_chunk();
+    if limit == 1 {
+        return wide_each(n, work);
+    }
+    let chunk = refresh_chunk(n.saturating_sub(single), wide_threads() + 1, limit);
+    wide_chunked(n, single, chunk, n >= 4 && local_refresh_work(), work);
+}
+
+/// Leave at least 32 claims per worker on large copy batches, as the
+/// indexed scheduler did. In small batches a slow copy can occupy a worker
+/// while the others finish, so keep those claims individually available.
+fn refresh_chunk(copies: usize, workers: usize, limit: usize) -> usize {
+    (copies / workers.max(1) / 32).clamp(1, limit)
+}
+
+fn wide_chunked(n: usize, single: usize, chunk: usize, local: bool, work: impl Fn(usize) + Send + Sync + 'static) {
+    let single = single.min(n);
+    let shares = single + (n - single).div_ceil(chunk);
+    if shares <= 1 {
+        (0..n).for_each(work);
+        return;
+    }
+    wide_shares(shares, local, true, move |share| {
+        for i in refresh_share(share, n, single, chunk) {
+            work(i);
+        }
+    });
+}
+
+fn refresh_share(share: usize, n: usize, single: usize, chunk: usize) -> std::ops::Range<usize> {
+    if share < single {
+        return share..share + 1;
+    }
+    let from = single + (share - single) * chunk;
+    from..from.saturating_add(chunk).min(n)
+}
+
+fn wide_shares(n: usize, local: bool, grouped: bool, work: impl Fn(usize) + Send + Sync + 'static) {
     // VICTORY_REFRESH_LOCAL_WORK=1 gives the submission thread only its
     // own indices. The old shared drain can run another caller's texture
     // or snapshot job before it returns. The title and upload bytes are
     // read and written by the same refresh, once per index as before.
-    if crate::asked_for!("VICTORY_REFRESH_LOCAL_WORK") && n >= 4 {
+    if local && n >= 2 {
         let began = std::time::Instant::now();
         let workers = workers();
-        static HELPERS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        let kept = *HELPERS.get_or_init(wide_threads);
+        let kept = wide_threads();
         let helpers = kept.min(n - 1);
-        let batch = Arc::new(indexed::Batch::new(n, helpers + 1, work));
+        // The ordinary scheduler groups nearby page checks on large heaps.
+        // An explicit share already holds a texture or a group of copies.
+        let per_claim = if grouped { 1 } else { (n / (helpers + 1) / 32).clamp(1, 8) };
+        let batch = Arc::new(indexed::Batch::new(n, per_claim, work));
         let wake = {
             let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
             let wake = helpers.saturating_sub(queue.len());
@@ -2128,9 +2199,60 @@ pub(crate) fn back_line(frames: f64) {
 
 #[cfg(test)]
 mod wide_tests {
-    use super::{Job, PIECE, WIDE_JOB, copy_jobs, find_pieces, wide};
+    use super::{Job, PIECE, WIDE_JOB, copy_jobs, find_pieces, refresh_chunk, refresh_share, wide, wide_chunked};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn a_short_copy_suffix_stays_available_to_individual_workers() {
+        assert_eq!(refresh_chunk(7, 5, 4), 1);
+        assert_eq!(refresh_chunk(480, 5, 4), 3);
+        assert_eq!(refresh_chunk(5500, 5, 4), 4);
+    }
+
+    #[test]
+    fn texture_shares_are_individual_and_only_the_last_copy_share_is_short() {
+        let ranges: Vec<_> = (0..6).map(|i| refresh_share(i, 23, 3, 8)).collect();
+        assert_eq!(ranges, [0..1, 1..2, 2..3, 3..11, 11..19, 19..23]);
+    }
+
+    #[test]
+    fn chunked_refreshes_finish_each_index_once() {
+        for local in [false, true] {
+            for (n, textures, chunk) in [(0, 0, 4), (2, 5, 4), (7, 0, 8), (15, 15, 4), (1503, 7, 4)] {
+                let seen: Arc<Vec<_>> = Arc::new((0..n).map(|_| AtomicUsize::new(0)).collect());
+                let counted = seen.clone();
+                wide_chunked(n, textures, chunk, local, move |i| {
+                    counted[i].fetch_add(1, Ordering::Relaxed);
+                });
+                assert!(seen.iter().all(|v| v.load(Ordering::Relaxed) == 1), "{n} refreshes, {textures} textures, local {local}");
+            }
+        }
+    }
+
+    #[test]
+    fn nested_local_refreshes_finish_without_picking_up_another_outer_share() {
+        thread_local! {
+            static IN_OUTER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        let reentered = Arc::new(AtomicUsize::new(0));
+        let seen: Arc<Vec<_>> = Arc::new((0..17 * 8).map(|_| AtomicUsize::new(0)).collect());
+        let (other, counted) = (reentered.clone(), seen.clone());
+        wide_chunked(17, 3, 4, true, move |outer| {
+            let previous = IN_OUTER.replace(true);
+            if previous {
+                other.fetch_add(1, Ordering::Relaxed);
+            }
+            let counted = counted.clone();
+            // Eight copies make just two shares, still the caller's own batch.
+            wide_chunked(8, 0, 4, true, move |inner| {
+                counted[outer * 8 + inner].fetch_add(1, Ordering::Relaxed);
+            });
+            IN_OUTER.set(previous);
+        });
+        assert_eq!(reentered.load(Ordering::Relaxed), 0);
+        assert!(seen.iter().all(|v| v.load(Ordering::Relaxed) == 1));
+    }
 
     /// Every job runs once, however many there are, and `wide` returns
     /// only when all have.
@@ -2801,6 +2923,17 @@ fn word_runs(at: usize, title: &[u8], held: &[u8]) -> Vec<(usize, usize)> {
     dword_runs(at, title, held, 0)
 }
 
+/// VICTORY_REFRESH_AVX2=1 also uses the word comparison for copy refresh
+/// and write-back. Both scans read existing CPU-side slices in place and
+/// yield the same dword runs to the uploader or the title-memory writer.
+fn refresh_word_runs(at: usize, title: &[u8], held: &[u8]) -> Vec<(usize, usize)> {
+    if crate::asked_for!("VICTORY_REFRESH_AVX2") {
+        word_runs(at, title, held)
+    } else {
+        dword_runs(at, title, held, 0)
+    }
+}
+
 /// # Safety
 /// AVX2, and two slices of one length, whole words.
 #[cfg(target_arch = "x86_64")]
@@ -2894,7 +3027,7 @@ fn put_changed(at: usize, title: &[u8], merged: &[u8]) -> usize {
         }
         return merged.len();
     }
-    let mut runs = dword_runs(at, title, merged, 0);
+    let mut runs = refresh_word_runs(at, title, merged);
     if runs.len() > 64 {
         runs = dword_runs(at, title, merged, 32);
         PUT[3].fetch_add(1, Ordering::Relaxed);
@@ -3536,7 +3669,7 @@ pub(crate) fn window_use() -> [u64; 8] {
     let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
     for s in loose.values() {
         let copied = s.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let pages = copied.iter().filter(|&&at| at != 0).count() as u64;
+        let pages = copied.pages.iter().filter(|&&at| at != 0).count() as u64;
         out[0] += (pages * PAGE as u64).min(s.len);
         if crate::host::references(&s.buffer) > 1 {
             out[1] += 1;
@@ -3734,8 +3867,7 @@ impl Shadow {
             gpu,
             start,
             len,
-            copied: Mutex::new(vec![0; pages as usize]),
-            ranged: Mutex::default(),
+            copied: Mutex::new(Copied { pages: vec![0; pages as usize], ranges: Default::default() }),
             refresh_revision: AtomicU64::new(0),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
@@ -3767,9 +3899,7 @@ impl Shadow {
     /// watch names, cut to their written parts and compared by dwords
     /// against the zeros of the CPU's side, as every later refresh does.
     fn start_fresh(&mut self) {
-        for at in self.copied.get_mut().unwrap_or_else(|e| e.into_inner()).iter_mut() {
-            *at = FRESH_TAKEN;
-        }
+        self.copied.get_mut().unwrap_or_else(|e| e.into_inner()).pages.fill(FRESH_TAKEN);
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
@@ -4290,7 +4420,7 @@ impl Shadow {
         let base = start / PAGE;
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         busy.into_iter().any(|(a, e)| match crate::watch::asked(a, e) {
-            Some((_, written)) => !stale_pages_in(base, &copied, a, e, &written).is_empty(),
+            Some((_, written)) => !stale_pages_in(base, &copied.pages, a, e, &written).is_empty(),
             None => true,
         })
     }
@@ -4353,8 +4483,8 @@ impl Shadow {
             // read under the same lock as the list.
             let (stale, took): (Vec<usize>, Vec<u64>) = {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                let stale = stale_pages_in(base, &copied, a, e, &written);
-                let took = stale.iter().map(|&page| copied.get(page - base).copied().unwrap_or(0)).collect();
+                let stale = stale_pages_in(base, &copied.pages, a, e, &written);
+                let took = stale.iter().map(|&page| copied.pages.get(page - base).copied().unwrap_or(0)).collect();
                 (stale, took)
             };
             if stale.is_empty() {
@@ -4451,7 +4581,7 @@ impl Shadow {
                     self.forget_refresh();
                 }
                 for page in taken {
-                    if let Some(at) = copied.get_mut(page - base) {
+                    if let Some(at) = copied.pages.get_mut(page - base) {
                         *at = now;
                     }
                 }
@@ -4629,7 +4759,7 @@ impl Shadow {
                 return false;
             }
             let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-            crate::watch::nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to), remember)
+            crate::watch::nothing_new(from, to, start / PAGE, &copied.pages, copied.ranged(from, to), remember)
         };
         #[cfg(feature = "diagnostics")]
         if same {
@@ -4644,13 +4774,6 @@ impl Shadow {
         if crate::watch::memo::enabled() {
             self.refresh_revision.fetch_add(1, Ordering::Release);
         }
-    }
-
-    /// The latest asking after which a range that holds `[from, to)` was
-    /// taken whole (0: none is known). The caller holds `copied`'s lock.
-    fn ranged(&self, from: usize, to: usize) -> u64 {
-        let ranged = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
-        ranged.iter().filter(|r| r.0 <= from && to <= r.1).map(|r| r.2).max().unwrap_or(0)
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
@@ -4753,7 +4876,7 @@ impl Shadow {
         // of the heap's buffer views alone two ends for each of 4,400
         // copies, every frame. A range that was taken whole, and not written
         // since, is as it was.
-        let ranged = if crate::watch::light() { self.ranged(from, to) } else { 0 };
+        let ranged = if crate::watch::light() { copied.ranged(from, to) } else { 0 };
         let (mut runs, mut run) = (Vec::new(), None::<(usize, bool)>);
         // Pages taken before and written since: in the order of their runs.
         let mut again_at: Vec<(usize, u64)> = Vec::new();
@@ -4766,7 +4889,7 @@ impl Shadow {
                 }
                 _ => 0,
             };
-            let at = &mut copied[page - base];
+            let at = &mut copied.pages[page - base];
             let taken = (*at).max(ranged);
             if taken == 0 || write > taken {
                 // A page only partly in the range is copied in part: it
@@ -4804,7 +4927,7 @@ impl Shadow {
         let bytes = self.take_all(runs);
         if crate::watch::light() {
             // All of the range is in the copy as of this asking.
-            let mut ranged = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
+            let ranged = &mut copied.ranges;
             ranged[0] = (from, to, now);
             if to - from >= ranged[1].1 - ranged[1].0 {
                 ranged[1] = (from, to, now);
@@ -4959,7 +5082,7 @@ impl Shadow {
                 // refresh lie apart.
                 let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at - start), n) };
                 let was = crate::host::upcheck::on().then(|| held.to_vec());
-                let runs = if whole { vec![(0, n)] } else { dword_runs(at, held, title, 0) };
+                let runs = if whole { vec![(0, n)] } else { refresh_word_runs(at, held, title) };
                 for &(a, len) in &runs {
                     held[a..a + len].copy_from_slice(&title[a..a + len]);
                     self.changed(at - start + a, at - start + a + len);
@@ -5489,7 +5612,7 @@ impl Shadow {
             return false;
         };
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(at) = copied.get_mut(page) else {
+        let Some(at) = copied.pages.get_mut(page) else {
             return false;
         };
         let held = *at != 0 && *at >= before && crate::watch::block_published(block);
